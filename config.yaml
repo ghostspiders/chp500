@@ -1,0 +1,50 @@
+# =====================================================================
+# 中国500指数（China 500）编制参数表
+# 对应文档：docs/中国500指数编制方法论.md §10
+# =====================================================================
+
+# ---- 基本 ----
+target_count: 500            # 目标成分数
+base_currency: CNY           # 基准货币（多币种折算目标）
+
+# ---- 准入门槛（§5）----
+mcap_min: 40000000000        # 未调整总市值门槛（CNY，委员会动态区间 300~500 亿）
+iwf_min: 0.20                # 自由流通比例（IWF）下限
+iwf_delist_threshold: 0.50   # 自由流通比例跌破则剔除
+liquidity_ratio_min: 1.0     # 6 个月月均成交量 / 自由流通股数（A 股基准）
+# 跨市场分市场流动性下限：港股/美股换手率结构低于 A 股，统一 1.0 会误杀多数中资港股/中概 ADR
+liquidity_ratio_min_by_market:
+  A: 1.0
+  HK: 0.30
+  US: 0.30
+listing_min_months: 12       # 最小上市时长（快速通道可豁免）
+require_4q_positive: true    # TTM 4 季累计净利为正（核心盈利门槛）
+
+# ---- 行业（§6）----
+sector_scheme: GICS          # GICS（退化选项: CITIC 申万/中信）
+sector_cap_mode: passive     # passive（被动锚定市场）| soft（软上限）
+max_sector_weight: 0.20      # 软上限阈值（仅 soft 模式生效）
+
+# ---- 权重（§7）----
+single_cap_mode: monitored   # monitored（监控）| hard（硬封顶）| none（不限制）
+cap_single: 0.10             # 硬封顶阈值（仅 hard 模式生效）
+convergence_tol: 1e-6        # 权重迭代收敛容差（hard 模式）
+
+# ---- 再平衡与维护（§8）----
+rebalance_freq: quarterly    # quarterly | semi_annual
+iwf_refresh: weekly          # IWF / 股本刷新频率
+buffer_low: 400              # 缓冲区下界（现有成分豁免剔除）
+buffer_high: 550             # 缓冲区上界
+fast_entry_rank: 50          # 快速纳入排名阈值（豁免上市时长）
+committee_discretion: true   # 委员会裁量（非全自动定稿）
+
+# ---- 覆盖范围 ----
+include_bse: false           # 是否含北交所
+markets:                     # 覆盖市场
+  - A
+  - HK
+  - US
+
+# ---- 数据源 ----
+data_source: akshare         # akshare（主）；可选 tushare 补充港股/美股基本面
+cache_dir: .cache            # 数据缓存目录（parquet）

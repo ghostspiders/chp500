@@ -1,0 +1,11 @@
+# 核心依赖（M1–M5：数据 + 编制流水线）
+akshare
+pandas
+numpy
+pyarrow
+pyyaml
+python-dotenv
+
+# 可视化与看板（M6）
+plotly
+streamlit

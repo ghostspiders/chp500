@@ -1,0 +1,15 @@
+# 虚拟环境
+.venv/
+
+# 数据缓存
+.cache/
+
+# 运行产物
+outputs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 工具/IDE 内部目录
+.zcode/

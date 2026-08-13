@@ -1,0 +1,101 @@
+# China 500 — 中国500指数编制
+
+一个对标 **标普 500（S&P 500）** 特质的中国宽基指数设计方案与编制系统：
+
+- **全域资产覆盖**：A 股 + 港股中资 + 美股中概（ADR）全量（MVP 先落地 A 股）
+- **行业动态平衡**：自由流通市值加权 + 集中度监控（可选软/硬上限）
+- **严格的盈利筛选**：TTM 4 季累计净利为正 + 最近单季为正（GAAP 口径）
+- **指数除数（Divisor）** 维护走势连续；**委员会裁量**层保留非全自动定稿
+
+---
+
+## 项目状态
+
+| 阶段 | 状态 | 交付物 |
+|---|---|---|
+| Phase 1 | ✅ 已完成 | 方法论文档 + 落地蓝图 |
+| Phase 2 | ✅ 核心已实现 | 数据层 + 编制流水线 + 指数序列 + 可视化看板 + 回测（**A + 港股中资 + 美股中概 ADR 跨市场 demo 跑通**）|
+
+> 当前仓库已包含**可运行的编制流水线**（demo 模式）。完整覆盖 A+HK+ADR 需在生产环境（东财市值主机可达或配 Tushare）启用。
+
+---
+
+## 文档导航
+
+- [中国500指数编制方法论](docs/中国500指数编制方法论.md) — 规则、参数、算法伪代码、技术难点
+- [落地蓝图（Phase 2）](docs/落地蓝图.md) — 架构、模块、配置、可视化与回测
+
+---
+
+## 快速开始（demo 模式）
+
+```bash
+python -m venv .venv && source .venv/Scripts/activate
+pip install -r requirements.txt
+
+# 编制一期成分 + 指数序列（用本环境可用接口 + 静态份额参考）
+python scripts/build_index.py --mode demo --as-of 2026-08-13
+
+# 绩效统计
+python scripts/backtest.py
+
+# 可视化看板（浏览器打开 http://localhost:8501）
+streamlit run cn500/viz/app.py
+```
+
+输出在 `outputs/`：
+- `constituents.csv` 本期成分（权重、行业、达标诊断、超上限标记）
+- `index.csv` 价格指数 + 全收益指数序列
+- `meta.json` 运行元信息
+
+---
+
+## 项目结构
+
+```
+cn500/
+├── config.py / config.yaml       # 参数表（对应方法论 §10）
+├── data/
+│   ├── adapters.py               # AkShare 适配（已验证可用接口 + demo 快照）
+│   └── cache.py                  # parquet 缓存
+├── filter/screens.py             # 6 大准入筛选 + 剔除检查
+├── sector/classifier.py          # 行业映射（东财行业→GICS风格）+ 配比
+├── weight/calculator.py          # 自由流通加权 + 单股上限（none/monitored/hard）
+├── rebalance/scheduler.py        # 季度再平衡 + 缓冲 + 快速纳入
+├── committee.py                  # 委员会裁量层（非全自动定稿）
+├── index/series.py               # 除数 + 价格/全收益指数
+└── viz/                         # plotly 图表 + streamlit 看板
+scripts/                         # build_index.py / backtest.py
+data/demo_universe.csv            # 演示用静态份额参考（近似，标注 illustrative）
+```
+
+---
+
+## 数据流
+
+```
+[Universe] → [6 大准入筛选] → [行业配比] → [权重+除数] → [委员会复核]
+         → [指数序列(价格/全收益)] → [看板 / 回测]
+```
+
+---
+
+## 已知限制（重要，使用须知）
+
+1. **数据源环境依赖（本沙箱）**：东财实时市值主机与历史主机在本环境被防火墙 RESET。已改用**可达接口**实现跨市场 demo：
+   - A 股现价/成交量：`stock_zh_a_spot`（Sina 批量）；净利润/行业：`stock_yjbb_em`；历史行情/流动性：`stock_zh_a_daily`（Sina 日线，**前复权 qfq**）。
+   - 港股/美股行情（现价+成交量+历史）：`stock_hk_daily` / `stock_us_daily`（**Sina，可达**）。
+   - 多币种折算汇率：中国银行历史汇率 `currency_boc_sina`（`央行中间价/100` = CNY per 单位，Sina/BOC 主机，**可达**）；接口不可达时回退静态近似（USD≈7.10、HKD≈0.91）。
+   - **生产模式**（`--mode live`）需东财主机可达，或接入 Tushare 补港股/美股基本面与实时市值。
+2. **演示份额/盈利为近似（标注 illustrative）**：`data/demo_universe.csv`（A）、`data/demo_hk.csv`、`data/demo_us.csv`（中资港股/中概 ADR）中的总股本、IWF、TTM 净利润、行业为**近似参考**，用于跑通跨市场流程；生产应取实时自由流通股本与审计财报。HK/US 仅覆盖约 40+ 只代表性中资股（非全量）。
+3. **跨市场合并规则（去重、不重复计入）**：同一经济主体若同时在 A/港股/ADR 上市，按**主上市地优先级 A > HK > US** 计为单一成分（与 MSCI/FTSE 全球指数一致，避免跨市场重复计入）。仅在某市场挂牌的主体（如腾讯仅在港股、拼多多仅在美国）则按该市场计价并做多币种折算——此即「全域覆盖」的实现。实体映射键为各参考表的 `entity_id` 列。
+4. **流动性阈值按市场分设**：A 股换手率显著高于港股/美股，统一 `1.0` 会把多数中资港股/中概 ADR 误杀。已设为分市场下限 `liquidity_ratio_min_by_market: {A:1.0, HK:0.30, US:0.30}`（`config.yaml` 可调）。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
+5. **指数序列处理**：历史行情用**前复权(qfq)** 价格以保证连续；跨源偶有缺失交易日，按「个股最新已知价向前填充(ffill)」对齐，避免成分缺数导致指数无谓跳变。全收益指数当前**未含分红**（== 价格指数），接分红数据后即分叉。
+6. **Sina 限流/瞬时失败**：`stock_hk_daily`/`stock_us_daily` 偶发返回空表/缺字段，适配器已做 3 次重试与字段校验；历史行情按 `code` 缓存于 `.cache/`，重跑可加速并提升稳定性。
+7. **仅演示规模**：当前 demo 约 45 只成分（26 A / 15 HK / 4 US），远小于目标 500；单一个股权重偏高（如腾讯 ~24%）属样本量不足所致，非算法问题。
+
+---
+
+## 免责声明
+
+本项目为**指数编制方法论研究与教学用途**，所有规则、参数、成分均为示例性设计，**不构成任何投资建议**。实际投资请参考官方授权指数与持牌机构。

@@ -52,6 +52,8 @@ def build_snapshot(as_of, mode, markets, universe="curated"):
 
 def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     out_dir.mkdir(parents=True, exist_ok=True)
+    if as_of is None:
+        as_of = datetime.now().strftime("%Y-%m-%d")
     as_of = pd.Timestamp(as_of)
     markets = markets or CONFIG.get("markets", ["A", "HK", "US"])
 

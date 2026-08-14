@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>中国500指数 · CN 500 Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>中国500指数 <span class="badge">CN 500</span></h1>
+    <div class="controls">
+      <label>宇宙
+        <select id="universe">
+          <option value="expanded">expanded（~500）</option>
+          <option value="curated">curated（精选）</option>
+        </select>
+      </label>
+      <button id="reload">刷新数据</button>
+      <button id="build">重新构建</button>
+      <span id="status" class="status"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="kpis" id="kpis"></section>
+
+    <section class="grid">
+      <div class="card"><h3>指数走势（基点 1000）</h3><div id="chart-index" class="plot"></div></div>
+      <div class="card"><h3>行业权重分布</h3><div id="chart-sector" class="plot"></div></div>
+      <div class="card"><h3>市场权重分布</h3><div id="chart-market" class="plot"></div></div>
+      <div class="card wide"><h3>个股权重 TOP 20</h3><div id="chart-top" class="plot"></div></div>
+    </section>
+
+    <section class="card">
+      <h3>成分明细 <span id="tbl-count" class="muted"></span></h3>
+      <div class="table-wrap"><table id="tbl"><thead>
+        <tr><th>#</th><th>代码</th><th>名称</th><th>市场</th><th>行业</th><th>权重</th></tr>
+      </thead><tbody></tbody></table></div>
+    </section>
+  </main>
+
+  <footer>
+    <p class="muted">指数编制方法论研究与教学用途，不构成投资建议。后端 REST API：<code>/api/summary</code>、<code>/api/build</code>。</p>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

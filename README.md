@@ -41,10 +41,28 @@ python scripts/build_index.py --mode demo --universe expanded --as-of 2026-08-13
 
 # 绩效统计
 python scripts/backtest.py
-
-# 可视化看板（浏览器打开 http://localhost:8501）
-streamlit run cn500/viz/app.py
 ```
+
+## 前后端分离服务（Web 看板）
+
+架构：**Python 后端（FastAPI REST API）** + **独立前端（frontend/ 静态页，无构建步骤）**。
+后端只读取已落盘的 `outputs/<universe>` 产物，`/api/summary` 秒级响应；`/api/build`
+在后台任务中跑编制流水线，前端轮询状态后刷新。
+
+```bash
+# 启动服务（默认 127.0.0.1:8000）
+python scripts/serve.py
+# 或自定义端口 / 对外暴露
+python scripts/serve.py --port 8000 --host 0.0.0.0
+
+# 浏览器打开 http://localhost:8000
+```
+
+- 首页（`/`）即看板：KPI、指数走势、行业/市场分布、TOP20、成分明细表
+- 后端接口：`/api/health`、`/api/universes`、`/api/summary?universe=expanded`、
+  `POST /api/build`、`/api/build/status?universe=expanded`
+- 前端纯静态（`frontend/index.html` / `app.js` / `style.css`），Plotly.js 走 CDN，无需 npm/打包；
+  若前端独立部署到其它域名/端口，CORS 已放开（`allow_origins=["*"]`）
 
 输出在 `outputs/`：
 - `constituents.csv` 本期成分（权重、行业、达标诊断、超上限标记）
@@ -58,17 +76,21 @@ streamlit run cn500/viz/app.py
 ```
 cn500/
 ├── config.py / config.yaml       # 参数表（对应方法论 §10）
+├── api/                         # 后端服务（FastAPI，前后端分离）
+│   ├── main.py                  # REST API 路由 + 静态前端挂载
+│   └── aggregate.py             # 读取 outputs/<universe> 组装前端汇总视图
 ├── data/
-│   ├── adapters.py               # AkShare 适配（已验证可用接口 + demo 快照）
-│   └── cache.py                  # parquet 缓存
-├── filter/screens.py             # 6 大准入筛选 + 剔除检查
-├── sector/classifier.py          # 行业映射（东财行业→GICS风格）+ 配比
-├── weight/calculator.py          # 自由流通加权 + 单股上限（none/monitored/hard）
-├── rebalance/scheduler.py        # 季度再平衡 + 缓冲 + 快速纳入
-├── committee.py                  # 委员会裁量层（非全自动定稿）
-├── index/series.py               # 除数 + 价格/全收益指数
-└── viz/                         # plotly 图表 + streamlit 看板
-scripts/                         # build_index.py / backtest.py
+│   ├── adapters.py              # AkShare 适配（已验证可用接口 + demo 快照）
+│   └── cache.py                 # parquet 缓存
+├── filter/screens.py            # 6 大准入筛选 + 剔除检查
+├── sector/classifier.py         # 行业映射（东财行业→GICS风格）+ 配比
+├── weight/calculator.py         # 自由流通加权 + 单股上限（none/monitored/hard）
+├── rebalance/scheduler.py       # 季度再平衡 + 缓冲 + 快速纳入
+├── committee.py                 # 委员会裁量层（非全自动定稿）
+├── index/series.py              # 除数 + 价格/全收益指数
+└── viz/charts.py                # plotly 图表（后端复用库，前端改用 plotly.js）
+frontend/                        # 静态前端：index.html / app.js / style.css
+scripts/                         # serve.py / build_index.py / backtest.py
 data/demo_universe.csv            # 演示用静态份额参考（近似，标注 illustrative）
 ```
 

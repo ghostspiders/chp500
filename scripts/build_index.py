@@ -33,8 +33,12 @@ from cn500.committee import review  # noqa: E402
 from cn500.index import series as idx  # noqa: E402
 
 
-def build_snapshot(as_of, mode, markets):
+def build_snapshot(as_of, mode, markets, universe="curated"):
     if mode == "demo":
+        if universe == "expanded":
+            print(f"[snap] demo 扩展宇宙：全 A(真实名/价/利+近似股本)+HK/US 参考（markets={markets}）...")
+            from cn500.data import universe as univ
+            return univ.build_expanded_cross_market_snapshot(as_of, markets)
         print(f"[snap] demo 模式：跨市场快照（markets={markets}）...")
         return adapters.build_cross_market_snapshot(as_of, markets)
     else:
@@ -46,16 +50,16 @@ def build_snapshot(as_of, mode, markets):
         raise NotImplementedError("live 模式需东财市值主机可达；本环境被墙，请用 demo 或配 Tushare。")
 
 
-def run(as_of, mode, out_dir: Path, markets=None):
+def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     out_dir.mkdir(parents=True, exist_ok=True)
     as_of = pd.Timestamp(as_of)
     markets = markets or CONFIG.get("markets", ["A", "HK", "US"])
 
-    snapshot = build_snapshot(as_of, mode, markets)
-    # 1) 准入筛选
-    diag = screens.add_screen_diagnostics(snapshot, as_of)
-    eligible = diag[diag["eligible"]].copy()
-    print(f"[screen] 候选池={len(snapshot)} 通过准入={len(eligible)}")
+    snapshot = build_snapshot(as_of, mode, markets, universe)
+    # 1) 准入筛选 + 按规模选取最多 target_count 只成分
+    n_target = int(CONFIG.get("target_count", 500))
+    eligible = screens.select_constituents(snapshot, as_of)
+    print(f"[screen] 候选池={len(snapshot)} 通过准入后按规模选取={len(eligible)}（目标≤{n_target}）")
 
     # 2) 行业分类 + 配比（快照已带 sector；若缺失则从 industry 映射）
     elig = eligible
@@ -95,19 +99,26 @@ def run(as_of, mode, out_dir: Path, markets=None):
         ser = ser.mask(bad, ser.shift(1))
         return ser.ffill().bfill()
 
+    # 按市场批量并发抓取历史行情（已按 code 全量缓存，重跑命中缓存）
+    a_codes = constituents.loc[constituents["market"] == "A", "code"].tolist()
+    hk_codes = constituents.loc[constituents["market"] == "HK", "code"].tolist()
+    us_codes = constituents.loc[constituents["market"] == "US", "code"].tolist()
+    a_prices, _ = adapters.fetch_hist(a_codes, start, end) if a_codes else (pd.DataFrame(), pd.DataFrame())
+    hk_prices, _ = adapters.fetch_hk_us_hist(hk_codes, "HK", start, end) if hk_codes else (pd.DataFrame(), pd.DataFrame())
+    us_prices, _ = adapters.fetch_hk_us_hist(us_codes, "US", start, end) if us_codes else (pd.DataFrame(), pd.DataFrame())
+
     for _, row in constituents.iterrows():
         eid, mkt, code, curr = row["entity_id"], row["market"], row["code"], row["curr"]
         try:
             if mkt == "A":
-                p, _ = adapters.fetch_hist([code], start, end)
-                if p.empty or code not in p.columns:
+                if code not in a_prices.columns:
                     continue
-                ser = p[code].copy()
+                ser = a_prices[code].copy()
             else:
-                p, _ = adapters.fetch_hk_us_hist([code], mkt, start, end)
-                if p.empty or code not in p.columns:
+                src = hk_prices if mkt == "HK" else us_prices
+                if code not in src.columns:
                     continue
-                ser = p[code].copy()
+                ser = src[code].copy()
                 fxser = fx_period.get(curr, pd.Series(1.0, index=ser.index))
                 fxser = fxser.reindex(ser.index).ffill().bfill().fillna(1.0)
                 ser = ser * fxser  # 折算 CNY
@@ -162,9 +173,11 @@ def main():
     ap.add_argument("--markets", default=",".join(CONFIG.get("markets", ["A", "HK", "US"])),
                     help="参与市场，逗号分隔，如 A,HK,US")
     ap.add_argument("--out-dir", default=str(BASE_DIR / "outputs"))
+    ap.add_argument("--universe", choices=["curated", "expanded"], default="curated",
+                    help="curated=精选参考集(~50)；expanded=全量 A 股(真实名/价/利+近似股本)推向~500")
     args = ap.parse_args()
     markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
-    run(args.as_of, args.mode, Path(args.out_dir), markets)
+    run(args.as_of, args.mode, Path(args.out_dir), markets, args.universe)
 
 
 if __name__ == "__main__":

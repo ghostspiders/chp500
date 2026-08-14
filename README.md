@@ -36,6 +36,9 @@ pip install -r requirements.txt
 # 编制一期成分 + 指数序列（用本环境可用接口 + 静态份额参考）
 python scripts/build_index.py --mode demo --as-of 2026-08-13
 
+# 扩展宇宙：全量 A 股(真实名/价/利+近似股本)+港股/美股参考，推向 ~500 成分
+python scripts/build_index.py --mode demo --universe expanded --as-of 2026-08-13 --out-dir outputs/expanded
+
 # 绩效统计
 python scripts/backtest.py
 
@@ -87,12 +90,12 @@ data/demo_universe.csv            # 演示用静态份额参考（近似，标�
    - 港股/美股行情（现价+成交量+历史）：`stock_hk_daily` / `stock_us_daily`（**Sina，可达**）。
    - 多币种折算汇率：中国银行历史汇率 `currency_boc_sina`（`央行中间价/100` = CNY per 单位，Sina/BOC 主机，**可达**）；接口不可达时回退静态近似（USD≈7.10、HKD≈0.91）。
    - **生产模式**（`--mode live`）需东财主机可达，或接入 Tushare 补港股/美股基本面与实时市值。
-2. **演示份额/盈利为近似（标注 illustrative）**：`data/demo_universe.csv`（A）、`data/demo_hk.csv`、`data/demo_us.csv`（中资港股/中概 ADR）中的总股本、IWF、TTM 净利润、行业为**近似参考**，用于跑通跨市场流程；生产应取实时自由流通股本与审计财报。HK/US 仅覆盖约 40+ 只代表性中资股（非全量）。
+2. **演示份额/盈利为近似（标注 illustrative）**：`data/demo_universe.csv`（A）、`data/demo_hk.csv`、`data/demo_us.csv`（中资港股/中概 ADR）中的总股本、IWF、TTM 净利润、行业为**近似参考**，用于跑通跨市场流程；生产应取实时自由流通股本与审计财报。HK/US 仅覆盖约 40+ 只代表性中资股（非全量）。扩展宇宙（`--universe expanded`）中 A 股的**公司名、现价、TTM 净利润、行业、流动性为真实值**（Sina / yjbb_em 抓取），仅**总股本与 IWF 为贴近真实 A 股规模分布的合成近似**（本沙箱不可达东财实时股本）。
 3. **跨市场合并规则（去重、不重复计入）**：同一经济主体若同时在 A/港股/ADR 上市，按**主上市地优先级 A > HK > US** 计为单一成分（与 MSCI/FTSE 全球指数一致，避免跨市场重复计入）。仅在某市场挂牌的主体（如腾讯仅在港股、拼多多仅在美国）则按该市场计价并做多币种折算——此即「全域覆盖」的实现。实体映射键为各参考表的 `entity_id` 列。
-4. **流动性阈值按市场分设**：A 股换手率显著高于港股/美股，统一 `1.0` 会把多数中资港股/中概 ADR 误杀。已设为分市场下限 `liquidity_ratio_min_by_market: {A:1.0, HK:0.30, US:0.30}`（`config.yaml` 可调）。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
+4. **流动性阈值按市场分设**：A 股"6 个月累计成交量/自由流通股"的全额周转口径对大市值股（如大行）普遍失真，且扩展宇宙的自由流通股为合成近似，故 A 股下限放宽到 `0.15`（仅剔除近零成交的失真/僵尸样本）；港股/美股换手率结构更低，沿用 `0.30`，避免误杀中资港股/中概 ADR。分市场下限见 `config.yaml: liquidity_ratio_min_by_market`。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
 5. **指数序列处理**：历史行情用**前复权(qfq)** 价格以保证连续；跨源偶有缺失交易日，按「个股最新已知价向前填充(ffill)」对齐，避免成分缺数导致指数无谓跳变。全收益指数当前**未含分红**（== 价格指数），接分红数据后即分叉。
 6. **Sina 限流/瞬时失败**：`stock_hk_daily`/`stock_us_daily` 偶发返回空表/缺字段，适配器已做 3 次重试与字段校验；历史行情按 `code` 缓存于 `.cache/`，重跑可加速并提升稳定性。
-7. **仅演示规模**：当前 demo 约 45 只成分（26 A / 15 HK / 4 US），远小于目标 500；单一个股权重偏高（如腾讯 ~24%）属样本量不足所致，非算法问题。
+7. **两种宇宙规模可选**：`--universe curated`（默认，约 60 只精选参考：A 蓝筹 + 港股中资 + 中概 ADR）与 `--universe expanded`（全量 A 股 + 港股/美股参考集，目标推向 ~500）。扩展模式下 A 股真实字段同上，但总股本/IWF 为合成近似，故点位与权重为**演示性**：用于验证大规模下的行业平衡、集中度与再平衡机制；成分数量与排序会随合成种子 (`seed=42`) 与行情日而变。扩展 A 股宇宙可落盘查看：`python -c "from cn500.data.universe import persist_expanded_a_universe; persist_expanded_a_universe('2026-08-13')"` → `data/demo_universe_expanded.csv`。
 
 ---
 

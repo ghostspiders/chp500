@@ -35,8 +35,9 @@ def add_screen_diagnostics(df: pd.DataFrame, as_of: datetime, cfg: dict | None =
     out["pass_iwf"] = out["iwf"] >= cfg["iwf_min"]
     # 5) 盈利门槛
     out["pass_profit"] = (out["ttm_net_profit"] > 0) & (out["latest_q_net_profit"] > 0)
-    # 6) 流动性（跨市场分市场阈值：A 股换手率显著高于港股/美股，统一 1.0 会把多数
-    #    中资港股/中概 ADR 误杀；故按市场分别设下限，更贴近真实跨市场指数做法）
+    # 6) 流动性（跨市场分市场阈值）。A 股"6 个月累计成交量/自由流通股"的全额周转口径
+    #    对大市值股普遍失真（大行等真实周转远低于 1.0），且扩展宇宙的自由流通股为合成近似；
+    #    故 A 股下限设为 0.15（仅剔除近零成交的失真/僵尸样本），港股/美股沿用 0.30。
     liq_min_by_mkt = cfg.get("liquidity_ratio_min_by_market", {}) or {}
     liq_thr = out["market"].map(lambda m: liq_min_by_mkt.get(m, cfg["liquidity_ratio_min"]))
     out["pass_liquidity"] = out["liquidity_ratio"] >= liq_thr
@@ -72,6 +73,21 @@ def select_eligible(df: pd.DataFrame, as_of: datetime, cfg: dict | None = None) 
     """返回通过全部 6 大准入指标的候选池。"""
     diag = add_screen_diagnostics(df, as_of, cfg)
     return diag[diag["eligible"]].copy()
+
+
+def select_constituents(df: pd.DataFrame, as_of: datetime, cfg: dict | None = None) -> pd.DataFrame:
+    """从候选池中按自由流通市值降序选取最多 target_count 只作为指数成分。
+
+    对标标普 500：取规模最具代表性的约 500 只；若候选不足 target_count 则全取。
+    行业/个股权重上限在 calculator 层处理（passive 监控或 hard 截断）。
+    """
+    cfg = cfg or CONFIG
+    diag = add_screen_diagnostics(df, as_of, cfg)
+    elig = diag[diag["eligible"]].copy()
+    n = int(cfg.get("target_count", 500))
+    if len(elig) > n:
+        elig = elig.sort_values("float_mcap", ascending=False).head(n).copy()
+    return elig
 
 
 def check_deletion(

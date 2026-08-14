@@ -16,7 +16,7 @@ _DEFAULTS = {
     "iwf_min": 0.20,
     "iwf_delist_threshold": 0.50,
     "liquidity_ratio_min": 1.0,
-    "liquidity_ratio_min_by_market": {"A": 1.0, "HK": 0.30, "US": 0.30},
+    "liquidity_ratio_min_by_market": {"A": 0.02, "HK": 0.30, "US": 0.30},
     "listing_min_months": 12,
     "require_4q_positive": True,
     "sector_scheme": "GICS",

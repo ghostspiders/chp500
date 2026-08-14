@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -153,25 +154,59 @@ def compute_ttm_earnings(earnings_long: pd.DataFrame, as_of: datetime | None = N
 # ---------------------------------------------------------------------------
 # 历史行情 / 流动性（A 股：Sina daily）
 # ---------------------------------------------------------------------------
-def fetch_hist(codes, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """A 股历史日线（Sina daily）。返回 (价格表, 成交量表)，索引=日期，列=code。"""
-    start_s = pd.Timestamp(start).strftime("%Y-%m-%d")
-    end_s = pd.Timestamp(end).strftime("%Y-%m-%d")
-    price_parts, vol_parts = [], []
-    for code in codes:
-        prefix = "sh" if str(code)[0] == "6" else "sz"
+def _sina_a_daily(code: str) -> pd.DataFrame | None:
+    """抓取单只 A 股全量日线（Sina，前复权）。返回 date/open/high/low/close/volume。
+
+    Sina 偶发瞬时失败/限流，做 3 次重试；失败返回 None。
+    """
+    prefix = "sh" if str(code)[0] == "6" else "sz"
+    last_err = None
+    for _ in range(3):
         try:
-            df = ak.stock_zh_a_daily(symbol=prefix + str(code), start_date=start_s,
-                                     end_date=end_s, adjust="qfq")
+            df = ak.stock_zh_a_daily(symbol=prefix + str(code), adjust="qfq")
+            if df is None or df.empty or "date" not in df.columns:
+                last_err = "empty/no-date"
+                continue
+            df = df.copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date")
+            return df.reset_index(drop=True)
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}:{e}"[:80]
+            continue
+    print(f"  [warn] A {code} 行情获取失败（{last_err}），跳过")
+    return None
+
+
+def _cached_a_daily(code: str) -> pd.DataFrame | None:
+    return CACHE.get_or_fetch(f"a_daily_{code}", _sina_a_daily, str(code))
+
+
+def fetch_hist(codes, start: str, end: str, workers: int = 12) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A 股历史日线（Sina daily，按 code 全量缓存复用，并发抓取）。
+
+    返回 (价格表, 成交量表)：索引=日期，列=code。
+    """
+    start_s = pd.Timestamp(start)
+    end_s = pd.Timestamp(end)
+    codes = [str(c) for c in codes]
+    price_parts, vol_parts = [], []
+
+    def _job(code: str):
+        return code, _cached_a_daily(code)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_job, c): c for c in codes}
+        for fut in as_completed(futs):
+            code, df = fut.result()
             if df is None or df.empty:
                 continue
-            df["date"] = pd.to_datetime(df["date"])
-            s_price = df.set_index("date")["close"].rename(code)
-            s_vol = df.set_index("date")["volume"].rename(code)
-            price_parts.append(s_price)
-            vol_parts.append(s_vol)
-        except Exception:  # noqa: BLE001
-            continue
+            m = (df["date"] >= start_s) & (df["date"] <= end_s)
+            sub = df.loc[m]
+            if sub.empty:
+                continue
+            price_parts.append(sub.set_index("date")["close"].rename(code))
+            vol_parts.append(sub.set_index("date")["volume"].rename(code))
     prices = pd.concat(price_parts, axis=1) if price_parts else pd.DataFrame()
     volumes = pd.concat(vol_parts, axis=1) if vol_parts else pd.DataFrame()
     return prices, volumes
@@ -239,22 +274,27 @@ def fetch_hk_us_price(codes, market: str, as_of: datetime) -> pd.Series:
     return pd.Series(out, name="price")
 
 
-def fetch_hk_us_hist(codes, market: str, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_hk_us_hist(codes, market: str, start: str, end: str, workers: int = 12) -> tuple[pd.DataFrame, pd.DataFrame]:
     """港股/美股历史日线。返回 (价格表, 成交量表)，索引=日期，列=code，成交量单位=股。"""
     start = pd.Timestamp(start)
     end = pd.Timestamp(end)
+    codes = [str(c) for c in codes]
     price_parts, vol_parts = [], []
-    for code in codes:
-        df = _cached_hk_us_daily(str(code), market)
-        if df is None or df.empty:
-            continue
-        d = df[(df["date"] >= start) & (df["date"] <= end)]
-        if d.empty:
-            continue
-        p = d.set_index("date")["close"].rename(str(code))
-        v = d.set_index("date")["volume"].rename(str(code))
-        price_parts.append(p)
-        vol_parts.append(v)
+
+    def _job(code: str):
+        return code, _cached_hk_us_daily(code, market)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_job, c): c for c in codes}
+        for fut in as_completed(futs):
+            code, df = fut.result()
+            if df is None or df.empty:
+                continue
+            d = df[(df["date"] >= start) & (df["date"] <= end)]
+            if d.empty:
+                continue
+            price_parts.append(d.set_index("date")["close"].rename(str(code)))
+            vol_parts.append(d.set_index("date")["volume"].rename(str(code)))
     prices = pd.concat(price_parts, axis=1) if price_parts else pd.DataFrame()
     volumes = pd.concat(vol_parts, axis=1) if vol_parts else pd.DataFrame()
     return prices, volumes

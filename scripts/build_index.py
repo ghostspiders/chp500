@@ -1,4 +1,4 @@
-"""CN 500 指数编制主流程（CLI）。
+"""CHP 500 指数编制主流程（CLI）。
 
 用法:
   python scripts/build_index.py --mode demo --as-of 2026-08-13
@@ -23,21 +23,21 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cn500.config import CONFIG, BASE_DIR  # noqa: E402
-from cn500.data import adapters  # noqa: E402
-from cn500.data import fx as fxmod  # noqa: E402
-from cn500.filter import screens  # noqa: E402
-from cn500.sector import classifier  # noqa: E402
-from cn500.weight import calculator  # noqa: E402
-from cn500.committee import review  # noqa: E402
-from cn500.index import series as idx  # noqa: E402
+from chp500.config import CONFIG, BASE_DIR  # noqa: E402
+from chp500.data import adapters  # noqa: E402
+from chp500.data import fx as fxmod  # noqa: E402
+from chp500.filter import screens  # noqa: E402
+from chp500.sector import classifier  # noqa: E402
+from chp500.weight import calculator  # noqa: E402
+from chp500.committee import review  # noqa: E402
+from chp500.index import series as idx  # noqa: E402
 
 
 def build_snapshot(as_of, mode, markets, universe="curated"):
     if mode == "demo":
         if universe == "expanded":
             print(f"[snap] demo 扩展宇宙：全 A(真实名/价/利+近似股本)+HK/US 参考（markets={markets}）...")
-            from cn500.data import universe as univ
+            from chp500.data import universe as univ
             return univ.build_expanded_cross_market_snapshot(as_of, markets)
         print(f"[snap] demo 模式：跨市场快照（markets={markets}）...")
         return adapters.build_cross_market_snapshot(as_of, markets)
@@ -169,7 +169,7 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CN 500 指数编制")
+    ap = argparse.ArgumentParser(description="CHP 500 指数编制")
     ap.add_argument("--as-of", default=datetime.now().strftime("%Y-%m-%d"), help="再平衡/评估日")
     ap.add_argument("--mode", choices=["demo", "live"], default="demo")
     ap.add_argument("--markets", default=",".join(CONFIG.get("markets", ["A", "HK", "US"])),

@@ -1,4 +1,4 @@
-# China 500 — 中国500指数编制
+# CHP 500 指数编制
 
 一个对标 **标普 500（S&P 500）** 特质的中国宽基指数设计方案与编制系统：
 
@@ -22,7 +22,7 @@
 
 ## 文档导航
 
-- [中国500指数编制方法论](docs/中国500指数编制方法论.md) — 规则、参数、算法伪代码、技术难点
+- [CHP500指数编制方法论](docs/CHP500指数编制方法论.md) — 规则、参数、算法伪代码、技术难点
 - [落地蓝图（Phase 2）](docs/落地蓝图.md) — 架构、模块、配置、可视化与回测
 
 ---
@@ -74,7 +74,7 @@ python scripts/serve.py --port 8000 --host 0.0.0.0
 ## 项目结构
 
 ```
-cn500/
+chp500/
 ├── config.py / config.yaml       # 参数表（对应方法论 §10）
 ├── api/                         # 后端服务（FastAPI，前后端分离）
 │   ├── main.py                  # REST API 路由 + 静态前端挂载
@@ -117,7 +117,7 @@ data/demo_universe.csv            # 演示用静态份额参考（近似，标�
 4. **流动性阈值按市场分设**：A 股"6 个月累计成交量/自由流通股"的全额周转口径对大市值股（如大行）普遍失真，且扩展宇宙的自由流通股为合成近似，故 A 股下限放宽到 `0.15`（仅剔除近零成交的失真/僵尸样本）；港股/美股换手率结构更低，沿用 `0.30`，避免误杀中资港股/中概 ADR。分市场下限见 `config.yaml: liquidity_ratio_min_by_market`。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
 5. **指数序列处理**：历史行情用**前复权(qfq)** 价格以保证连续；跨源偶有缺失交易日，按「个股最新已知价向前填充(ffill)」对齐，避免成分缺数导致指数无谓跳变。全收益指数当前**未含分红**（== 价格指数），接分红数据后即分叉。
 6. **Sina 限流/瞬时失败**：`stock_hk_daily`/`stock_us_daily` 偶发返回空表/缺字段，适配器已做 3 次重试与字段校验；历史行情按 `code` 缓存于 `.cache/`，重跑可加速并提升稳定性。
-7. **两种宇宙规模可选**：`--universe curated`（默认，约 60 只精选参考：A 蓝筹 + 港股中资 + 中概 ADR）与 `--universe expanded`（全量 A 股 + 港股/美股参考集，目标推向 ~500）。扩展模式下 A 股真实字段同上，但总股本/IWF 为合成近似，故点位与权重为**演示性**：用于验证大规模下的行业平衡、集中度与再平衡机制；成分数量与排序会随合成种子 (`seed=42`) 与行情日而变。扩展 A 股宇宙可落盘查看：`python -c "from cn500.data.universe import persist_expanded_a_universe; persist_expanded_a_universe('2026-08-13')"` → `data/demo_universe_expanded.csv`。
+7. **两种宇宙规模可选**：`--universe curated`（默认，约 60 只精选参考：A 蓝筹 + 港股中资 + 中概 ADR）与 `--universe expanded`（全量 A 股 + 港股/美股参考集，目标推向 ~500）。扩展模式下 A 股真实字段同上，但总股本/IWF 为合成近似，故点位与权重为**演示性**：用于验证大规模下的行业平衡、集中度与再平衡机制；成分数量与排序会随合成种子 (`seed=42`) 与行情日而变。扩展 A 股宇宙可落盘查看：`python -c "from chp500.data.universe import persist_expanded_a_universe; persist_expanded_a_universe('2026-08-13')"` → `data/demo_universe_expanded.csv`。
 
 ---
 

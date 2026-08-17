@@ -11,6 +11,6 @@ fastapi
 uvicorn
 plotly            # 后端图表库（charts.py 复用；前端用 plotly.js CDN）
 
-# 已弃用：streamlit 单体看板（改为 FastAPI + 静态前端，见 cn500/api、frontend/）
+# 已弃用：streamlit 单体看板（改为 FastAPI + 静态前端，见 chp500/api、frontend/）
 # streamlit
 

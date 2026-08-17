@@ -1,4 +1,4 @@
-"""CN 500 指数回测 / 绩效统计。
+"""CHP 500 指数回测 / 绩效统计。
 
 读取 outputs/index.csv，计算价格指数与全收益指数的年化收益、年化波动、
 最大回撤、夏普等，并输出。
@@ -44,7 +44,7 @@ def main():
     idx = pd.read_csv(Path(args.out_dir) / "index.csv")
     idx["date"] = pd.to_datetime(idx["date"])
 
-    print("== CN 500 指数绩效（基于 outputs/index.csv）==")
+    print("== CHP 500 指数绩效（基于 outputs/index.csv）==")
     for col in ["price_index", "total_return"]:
         m = metrics(idx[col])
         print(f"\n[{col}]")

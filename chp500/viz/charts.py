@@ -23,7 +23,7 @@ def fig_index(index: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=index["date"], y=index["price_index"], name="价格指数"))
     fig.add_trace(go.Scatter(x=index["date"], y=index["total_return"], name="全收益指数"))
-    fig.update_layout(title="CN 500 指数走势（基点 1000）", xaxis_title="日期",
+    fig.update_layout(title="CHP 500 指数走势（基点 1000）", xaxis_title="日期",
                       yaxis_title="指数点位", height=420)
     return fig
 

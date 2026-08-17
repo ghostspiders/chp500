@@ -1,4 +1,4 @@
-"""CN 500 后端服务（FastAPI）。
+"""CHP 500 后端服务（FastAPI）。
 
 架构：Python 后端（REST API） + 独立前端（frontend/ 静态页，通过 HTTP 调用本服务）。
 - /api/*   : 数据接口（汇总、宇宙列表、健康检查、触发构建）
@@ -6,7 +6,7 @@
 
 本地启动：
     python scripts/serve.py
-    # 或 uvicorn cn500.api.main:app --reload --port 8000
+    # 或 uvicorn chp500.api.main:app --reload --port 8000
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from . import aggregate  # noqa: E402
 
 FRONTEND_DIR = ROOT / "frontend"
 
-app = FastAPI(title="China 500 Index API", version="1.0.0")
+app = FastAPI(title="CHP 500 Index API", version="1.0.0")
 
 # 前后端分离：允许跨域（前端若独立部署到其它端口也可访问）
 app.add_middleware(

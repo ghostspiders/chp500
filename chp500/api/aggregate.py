@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,21 @@ import pandas as pd
 
 from ..config import BASE_DIR
 
+# 宇宙名会拼进文件系统路径，必须限定为安全的短标识符
+UNIVERSE_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+_UNIVERSE_RE = re.compile(UNIVERSE_NAME_PATTERN)
+
+# 权重榜首数量（前端 TOP 榜图表取该列表渲染）
+TOP_N = 30
+
+
+def is_valid_universe_name(name: str) -> bool:
+    return bool(_UNIVERSE_RE.fullmatch(name))
+
 
 def _find_output_dir(universe: str) -> Path:
+    if not is_valid_universe_name(universe):
+        raise FileNotFoundError(f"非法宇宙名：{universe!r}")
     base = BASE_DIR / "outputs"
     cand = base / universe
     if cand.exists():
@@ -33,7 +47,8 @@ def load_summary(universe: str) -> dict:
     if not cons_path.exists():
         raise FileNotFoundError(f"未找到宇宙 '{universe}' 的产物：{cons_path}（请先构建）")
 
-    c = pd.read_csv(cons_path)
+    # code 保持字符串，避免港股代码前导零（如 09988）被读成整数
+    c = pd.read_csv(cons_path, dtype={"code": str})
     w = c["weight"].astype(float)
 
     # 集中度
@@ -55,8 +70,8 @@ def load_summary(universe: str) -> dict:
     market_list = [{"market": str(m), "weight": float(v)} for m, v in markets.items()]
     market_counts = {str(m): int(n) for m, n in c.groupby("market").size().items()}
 
-    # Top 20
-    top = c.sort_values("weight", ascending=False).head(20)
+    # Top N 权重榜
+    top = c.sort_values("weight", ascending=False).head(TOP_N)
     top_list = [
         {
             "code": str(r["code"]),
@@ -97,6 +112,16 @@ def load_summary(universe: str) -> dict:
         for _, r in c.sort_values("weight", ascending=False).iterrows()
     ]
 
+    # 数据源覆盖（东财/EDGAR 真实数据 vs 静态/合成兜底）
+    src = {"shares": {}, "profit": {}}
+    if "shares_source" in c.columns:
+        src["shares"] = {str(k): int(v) for k, v in c["shares_source"].value_counts().items()}
+    if "profit_source" in c.columns:
+        src["profit"] = {str(k): int(v) for k, v in c["profit_source"].value_counts().items()}
+    n_all = max(len(c), 1)
+    real_shares = (src["shares"].get("em", 0) + src["shares"].get("reference", 0)) / n_all
+    real_profit = (src["profit"].get("em", 0) + src["profit"].get("edgar", 0)) / n_all
+
     return {
         "universe": universe,
         "as_of": meta.get("as_of"),
@@ -114,6 +139,9 @@ def load_summary(universe: str) -> dict:
         "constituents": cons_list,
         "index": idx_series,
         "meta": meta,
+        "data_sources": src,
+        "real_shares_ratio": real_shares,
+        "real_profit_ratio": real_profit,
     }
 
 

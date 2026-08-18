@@ -81,7 +81,8 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     cols = ["entity_id", "code", "name", "market", "curr", "sector", "industry",
             "price", "total_shares", "float_shares", "total_mcap", "float_mcap", "iwf",
             "ttm_net_profit", "latest_q_net_profit", "liquidity_ratio",
-            "n_listings", "listings", "weight", "single_exceed"]
+            "n_listings", "listings", "weight", "single_exceed",
+            "shares_source", "profit_source"]
     constituents = final[cols].sort_values("weight", ascending=False).reset_index(drop=True)
     constituents.to_csv(out_dir / "constituents.csv", index=False, encoding="utf-8-sig")
     print(f"[out] 成分已写入 {out_dir / 'constituents.csv'}（{len(constituents)} 只）")
@@ -149,8 +150,11 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
         print("[warn] 历史行情不足，跳过指数序列")
         index_df = None
 
-    # 各市场成分数量（用于元信息）
+    # 各市场成分数量与数据源覆盖（用于元信息）
     mkt_counts = constituents.groupby("market").size().to_dict()
+    src_shares = constituents["shares_source"].value_counts().to_dict() if "shares_source" in constituents else {}
+    src_profit = constituents["profit_source"].value_counts().to_dict() if "profit_source" in constituents else {}
+    n_total = max(len(constituents), 1)
     meta = {
         "as_of": str(as_of.date()),
         "mode": mode,
@@ -160,6 +164,14 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
         "n_eligible": int(len(eligible)),
         "n_constituents": int(len(constituents)),
         "constituents_by_market": {str(k): int(v) for k, v in mkt_counts.items()},
+        "shares_source_counts": {str(k): int(v) for k, v in src_shares.items()},
+        "profit_source_counts": {str(k): int(v) for k, v in src_profit.items()},
+        "real_shares_ratio": round(
+            (src_shares.get("em", 0) + src_shares.get("reference", 0)) / n_total, 4
+        ),
+        "real_profit_ratio": round(
+            (src_profit.get("em", 0) + src_profit.get("edgar", 0)) / n_total, 4
+        ),
         "config": CONFIG,
         "committee_summary": summary,
     }

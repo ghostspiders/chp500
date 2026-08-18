@@ -8,9 +8,9 @@
   - stock_hk_daily           : Sina 港股日线（可用，港股无东财墙）
   - stock_us_daily           : Sina 美股日线（可用）
   - currency_boc_sina        : 中行历史汇率（USD/HKD -> CNY，可用）
-  被防火墙的接口（生产/配 Tushare 时启用）：
-  - stock_zh_a_spot_em / stock_individual_info_em / stock_hk_spot_em /
-    stock_us_spot_em / stock_hk_hist / stock_us_hist（东财主机 RESET）
+  - stock_financial_hk_report_em : 港股三大报表（需国内网络/VPN；断线自动降级）
+  另见 em_snapshot.py（东财 push2 三市场市值/股本快照，需国内网络/VPN）
+  与 edgar.py（SEC EDGAR 美股净利，免认证）。
 """
 
 from __future__ import annotations
@@ -24,9 +24,11 @@ import numpy as np
 import pandas as pd
 
 from ..config import BASE_DIR, CONFIG
-from . import fx
+from . import edgar, fx
 from .cache import Cache
+from .em_snapshot import get_em_spot
 from .merge import merge_entities
+from .ttm_periods import compute_ttm_from_periods
 
 DATA_DIR = BASE_DIR / "data"
 CACHE = Cache()
@@ -354,12 +356,113 @@ def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
     out["sector"] = out["industry"].map(map_to_sector)
     out["liquidity_ratio"] = out["code"].map(liq)
     out["listing_date"] = pd.to_datetime(out["listing_date"])
+    out["shares_source"] = "reference"  # 人工核定参考股本（自由流通口径）
+    out["profit_source"] = "em"  # yjbb 真实财报
+    return out
+
+
+_HK_PROFIT_ITEM = "股东应占溢利"  # 归母净利润科目（港股利润表）
+
+
+def fetch_hk_profit_periods(code: str):
+    """港股净利润披露期 [(start, end, value), ...]（年度+中期合并，累计口径）。
+
+    金额为报告货币；本指数的中资股名单绝大多数以 CNY 报告（近似，个别
+    USD 报告者如中芯国际存在未折算偏差，见 README 数据源说明）。失败返回 None。
+    """
+    def _fetch():
+        parts = []
+        for ind in ("年度", "中期"):
+            try:
+                df = ak.stock_financial_hk_report_em(
+                    stock=str(code).zfill(5), symbol="利润表", indicator=ind
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if df is None or df.empty:
+                continue
+            sub = df[df["STD_ITEM_NAME"] == _HK_PROFIT_ITEM]
+            for _, r in sub.iterrows():
+                parts.append((
+                    pd.Timestamp(r["START_DATE"]),
+                    pd.Timestamp(r["REPORT_DATE"]),
+                    float(r["AMOUNT"]),
+                ))
+        return pd.DataFrame(parts, columns=["start", "end", "value"]) if parts else None
+
+    df = CACHE.get_or_fetch(f"hk_profit_{str(code)}", _fetch)
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return None
+    return [(r[0], r[1], r[2]) for r in df.itertuples(index=False, name=None)]
+
+
+def apply_em_shares_local(out: pd.DataFrame, em: pd.DataFrame | None, fxr: float) -> pd.DataFrame:
+    """用东财快照覆盖 HK/US listing 的价格/股本/市值（本币与 CNY），标记 shares_source。
+
+    em 为 None 或个股缺失时保留静态参考值（shares_source=static）。
+    """
+    out = out.copy()
+    out["shares_source"] = "static"
+    if em is None or em.empty:
+        return out
+    m = em.set_index("code")
+    hit = out["code"].isin(m.index)
+    idx = out.index[hit]
+    if not len(idx):
+        return out
+    price = out.loc[idx, "code"].map(m["price"]).astype(float)
+    tm = out.loc[idx, "code"].map(m["total_mcap_local"]).astype(float)
+    fm = out.loc[idx, "code"].map(m["float_mcap_local"]).astype(float)
+    valid = price > 0
+    idx = idx[valid]
+    price, tm, fm = price[valid], tm[valid], fm[valid]
+    out.loc[idx, "price"] = price.values
+    out.loc[idx, "total_shares"] = (tm / price).values
+    out.loc[idx, "float_shares"] = (fm / price).values
+    out.loc[idx, "iwf"] = (fm / tm).values
+    out.loc[idx, "total_mcap_local"] = tm.values
+    out.loc[idx, "float_mcap_local"] = fm.values
+    out.loc[idx, "total_mcap"] = (tm * fxr).values  # 折算 CNY
+    out.loc[idx, "float_mcap"] = (fm * fxr).values
+    out.loc[idx, "shares_source"] = "em"
+    return out
+
+
+def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.DataFrame:
+    """用真实财务源覆盖 TTM/最新单季：HK=东财港股财报，US=SEC EDGAR。
+
+    调用前 out 已含静态兜底值（ttm_net_profit / latest_q_net_profit）。
+    失败个股保留静态并标 profit_source=static。
+    """
+    out = out.copy()
+    out["profit_source"] = "static"
+    for i, r in out.iterrows():
+        try:
+            if market == "HK":
+                periods = fetch_hk_profit_periods(r["code"])
+                res = compute_ttm_from_periods(periods) if periods else None
+                if res and res["ttm"] is not None:
+                    out.loc[i, "ttm_net_profit"] = res["ttm"]
+                    out.loc[i, "latest_q_net_profit"] = res["latest_q"]
+                    out.loc[i, "profit_source"] = "em"
+            else:
+                res = edgar.fetch_us_net_income(r["code"], usd_cny=usd_cny)
+                if res is not None:
+                    out.loc[i, "ttm_net_profit"] = res["ttm"]
+                    out.loc[i, "latest_q_net_profit"] = res["latest_q"]
+                    out.loc[i, "profit_source"] = "edgar"
+        except Exception:  # noqa: BLE001
+            continue
     return out
 
 
 def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: pd.DataFrame) -> pd.DataFrame:
-    """港股/美股 listing 级快照：份额/行业来自 demo_hk.csv / demo_us.csv（近似，标注 illustrative）；
-    现价/成交量来自 Sina daily；市值按 as_of 汇率折算为 CNY。"""
+    """港股/美股 listing 级快照。
+
+    - 股本/市值：东财 push2 真实快照（需国内网络/VPN），缺失回落 demo CSV 静态参考；
+    - 财务：HK=东财港股财报（TTM+单季），US=SEC EDGAR；失败回落静态；
+    - 现价/成交量：Sina daily（东财不可达时价格仍以 Sina 为准，股本按静态计）。
+    """
     as_of = pd.Timestamp(as_of or datetime.now())
     fname = "demo_hk.csv" if market == "HK" else "demo_us.csv"
     curr = "HKD" if market == "HK" else "USD"
@@ -393,13 +496,17 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     out["float_mcap_local"] = out["price"] * out["float_shares"]
     out["total_mcap"] = out["total_mcap_local"] * fxr  # 折算 CNY
     out["float_mcap"] = out["float_mcap_local"] * fxr
-    out["ttm_net_profit"] = out["ttm_net_profit_cny"].astype(float)  # 已是 CNY
-    out["latest_q_net_profit"] = out["ttm_net_profit"]
+    out["ttm_net_profit"] = out["ttm_net_profit_cny"].astype(float)  # 静态兜底（已是 CNY）
+    out["latest_q_net_profit"] = out["ttm_net_profit"]  # 兜底近似：单季=TTM
     out["sector"] = out["sector"]
     out["industry"] = out["sector"]
-    out["is_st"] = out["name"].str.contains("ST", case=False, na=False)
     out["liquidity_ratio"] = out["code"].map(liq)
     out["listing_date"] = pd.to_datetime(out["listing_date"])
+
+    # 东财真实股本/市值覆盖（失败自动回落静态并标记）
+    out = apply_em_shares_local(out, get_em_spot(market), fxr)
+    # 真实财务覆盖（HK=东财财报 / US=EDGAR）
+    out = apply_real_earnings(out, market, usd_cny=fx.fx_rate_on(fx_table, as_of, "USD"))
     return out
 
 

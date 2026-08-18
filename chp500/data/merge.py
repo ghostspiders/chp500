@@ -60,6 +60,8 @@ def merge_entities(listing: pd.DataFrame) -> pd.DataFrame:
                 "is_china": True,
                 "listing_date": ld,
                 "liquidity_ratio": primary["liquidity_ratio"],
+                "shares_source": primary.get("shares_source", "static"),
+                "profit_source": primary.get("profit_source", "static"),
                 "n_listings": n_listings,
                 "listings": listings,
             }

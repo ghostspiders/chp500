@@ -1,16 +1,12 @@
-# 核心依赖（M1–M5：数据 + 编制流水线）
-akshare
-pandas
-numpy
-pyarrow
-pyyaml
-python-dotenv
+# 核心依赖（M1–M5：数据 + 编制流水线）—— 版本已按实测环境 pin
+akshare==1.18.91
+pandas==3.0.5
+numpy==2.5.2
+pyarrow==25.0.1
+PyYAML==6.0.3
+python-dotenv==1.2.3
 
 # 后端服务（M6：前后端分离，Python 后端）
-fastapi
-uvicorn
-plotly            # 后端图表库（charts.py 复用；前端用 plotly.js CDN）
-
-# 已弃用：streamlit 单体看板（改为 FastAPI + 静态前端，见 chp500/api、frontend/）
-# streamlit
-
+fastapi==0.141.1
+uvicorn==0.52.3
+# 前端图表使用 plotly.js（CDN），后端不再依赖 plotly

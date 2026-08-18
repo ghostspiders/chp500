@@ -51,3 +51,4 @@ markets:                     # 覆盖市场
 # ---- 数据源 ----
 data_source: akshare         # akshare（主）；可选 tushare 补充港股/美股基本面
 cache_dir: .cache            # 数据缓存目录（parquet）
+cache_ttl_days: 7            # 缓存有效期（天）：调小更即时但增加 AkShare 抓取量；留空/0 表示永不过期

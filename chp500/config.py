@@ -35,6 +35,7 @@ _DEFAULTS = {
     "markets": ["A", "HK", "US"],
     "data_source": "akshare",
     "cache_dir": ".cache",
+    "cache_ttl_days": 7,
 }
 
 

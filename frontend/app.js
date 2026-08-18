@@ -24,7 +24,11 @@ async function loadSummary() {
   try {
     const d = await api("/api/summary?universe=" + encodeURIComponent(universe));
     render(d);
-    setStatus("已加载 · as_of " + (d.as_of || "?"), "ok");
+    const cover = (d.real_shares_ratio != null)
+      ? " · 真实股本 " + Math.round(d.real_shares_ratio * 100) + "%" +
+        " / 真实利润 " + Math.round((d.real_profit_ratio || 0) * 100) + "%"
+      : "";
+    setStatus("已加载 · as_of " + (d.as_of || "?") + cover, "ok");
   } catch (e) {
     setStatus("错误：" + e.message, "err");
   }
@@ -64,12 +68,12 @@ function render(d) {
        text: d.markets.map((m) => pct(m.weight)), textposition: "outside" }],
     { ...PLOT_LAYOUT, yaxis: { tickformat: ".0%" }, height: 320 }, PLOT_CFG);
 
-  // Top20 横向柱
+  // Top30 横向柱
   const top = d.top.slice().reverse();
   Plotly.newPlot("chart-top",
     [{ y: top.map((t) => t.name), x: top.map((t) => t.weight), type: "bar", orientation: "h",
        text: top.map((t) => pct(t.weight)), textposition: "outside" }],
-    { ...PLOT_LAYOUT, xaxis: { tickformat: ".0%" }, height: 480, margin: { l: 90, r: 20, t: 10, b: 30 } }, PLOT_CFG);
+    { ...PLOT_LAYOUT, xaxis: { tickformat: ".0%" }, height: 700, margin: { l: 90, r: 20, t: 10, b: 30 } }, PLOT_CFG);
 
   // 明细表
   const rows = d.constituents.map((r, i) =>

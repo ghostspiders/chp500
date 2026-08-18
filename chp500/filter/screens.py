@@ -37,7 +37,7 @@ def add_screen_diagnostics(df: pd.DataFrame, as_of: datetime, cfg: dict | None =
     out["pass_profit"] = (out["ttm_net_profit"] > 0) & (out["latest_q_net_profit"] > 0)
     # 6) 流动性（跨市场分市场阈值）。A 股"6 个月累计成交量/自由流通股"的全额周转口径
     #    对大市值股普遍失真（大行等真实周转远低于 1.0），且扩展宇宙的自由流通股为合成近似；
-    #    故 A 股下限设为 0.15（仅剔除近零成交的失真/僵尸样本），港股/美股沿用 0.30。
+    #    故 A 股下限仅设为 0.02（只剔除近零成交的失真/僵尸样本），港股/美股沿用 0.30。
     liq_min_by_mkt = cfg.get("liquidity_ratio_min_by_market", {}) or {}
     liq_thr = out["market"].map(lambda m: liq_min_by_mkt.get(m, cfg["liquidity_ratio_min"]))
     out["pass_liquidity"] = out["liquidity_ratio"] >= liq_thr

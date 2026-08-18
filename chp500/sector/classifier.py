@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ..config import CONFIG
+
 # 关键词 -> 板块（按顺序匹配，先到先得）
 _SECTOR_KEYWORDS: list[tuple[str, list[str]]] = [
     ("金融", ["银行", "证券", "保险", "多元金融", "信托", "期货"]),
@@ -55,7 +57,7 @@ def allocate(
 
     返回带 weight（基础自由流通市值权重）与 sector_exceed（是否超软上限）的表。
     """
-    cfg = cfg or {}
+    cfg = CONFIG if cfg is None else cfg
     out = df.copy()
     total = out[weight_col].sum()
     out["weight"] = out[weight_col] / total if total > 0 else 0.0

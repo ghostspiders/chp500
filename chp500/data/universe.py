@@ -1,16 +1,11 @@
 """扩展宇宙（演示规模推向 ~500 成分）。
 
-数据源约束（本沙箱）：
-  - 可达：A 股代码/名称（stock_info_a_code_name）、现价/成交量（Sina spot）、
-    净利润/行业（yjbb_em）、历史行情（Sina daily）、港股/美股（Sina daily）、汇率（中行）。
-  - 不可达：东财批量市值/股本（被墙）。故**真实股本不可得**。
-
-策略（与 demo_hk/demo_us 一致，均为 illustrative）：
-  - 真实：A 股公司名、现价、TTM 净利（yjbb_em 真实）、6 个月成交量（Sina daily 真实）、行业（yjbb 真实）。
-  - 近似：总股本 / IWF 由「贴近真实 A 股规模分布」的 seeded 对数正态抽样给出；
-    市值 = 真实现价 × 近似股本。少数真实大市值（demo_universe.csv 中的蓝筹）沿用其
-    真实近似股本与跨市场 entity_id，保证跨市场去重仍然生效。
-  - 目标是演示「规模 ~500 下的行业平衡 / 集中度 / 再平衡」机制，而非真实指数点位。
+数据源：
+  - A 股公司名/现价/TTM 净利/行业/成交量：真实（Sina + 东财 yjbb）。
+  - 总股本/流通股本/IWF：优先东财 push2 快照（真实，需国内网络或 VPN）；
+    不可达时回落 seeded 合成近似并标记 shares_source=synthetic。
+  - demo_universe.csv 蓝筹沿用人工核定参考股本与跨市场 entity_id（source=reference），
+    其 IWF 为自由流通口径，优先于东财的流通口径。
 """
 
 from __future__ import annotations
@@ -33,9 +28,38 @@ from .adapters import (
     fetch_hk_us_hist,
 )
 from . import fx
+from .em_snapshot import get_em_spot
 from .merge import merge_entities
 
 DATA_DIR = BASE_DIR / "data"
+
+
+def apply_em_shares(df: pd.DataFrame, em: pd.DataFrame | None) -> pd.DataFrame:
+    """用东财快照替换合成股本：总股本=总市值/价、流通股本=流通市值/价、IWF=流通/总。
+
+    em 为 None（东财不可达）或个股缺失时保留合成值；source 标记 em/synthetic。
+    """
+    out = df.copy()
+    out["shares_source"] = "synthetic"
+    if em is None or em.empty:
+        return out
+    m = em.set_index("code")
+    hit = out["code"].isin(m.index)
+    if not hit.any():
+        return out
+    em_price = out.loc[hit, "code"].map(m["price"]).astype(float)
+    em_tm = out.loc[hit, "code"].map(m["total_mcap_local"]).astype(float)
+    em_fm = out.loc[hit, "code"].map(m["float_mcap_local"]).astype(float)
+    valid = em_price > 0
+    idx = out.index[hit][valid]
+    out.loc[idx, "price"] = em_price[valid].values
+    out.loc[idx, "total_shares"] = (em_tm[valid] / em_price[valid]).values
+    out.loc[idx, "float_shares"] = (em_fm[valid] / em_price[valid]).values
+    out.loc[idx, "iwf"] = (em_fm[valid] / em_tm[valid]).values
+    out.loc[idx, "total_mcap"] = em_tm[valid].values  # A 股快照本币即 CNY
+    out.loc[idx, "float_mcap"] = em_fm[valid].values
+    out.loc[idx, "shares_source"] = "em"
+    return out
 
 
 def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
@@ -87,10 +111,13 @@ def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
     out["float_mcap"] = out["price"] * out["float_shares"]
     out["liquidity_ratio"] = np.nan  # 候选阶段再算
 
-    # 5) 真实大市值蓝筹沿用 curated 真实近似股本 + 跨市场 entity_id（保证去重）
+    # 4b) 东财真实股本/市值（VPN 或国内网络可达时生效；失败回落上方合成值）
+    out = apply_em_shares(out, get_em_spot("A"))
+
+    # 5) 真实大市值蓝筹沿用 curated 参考股本 + 跨市场 entity_id（保证去重）。
+    #    参考表的 IWF 为人工核定自由流通口径（如大行 0.2），优先于东财流通口径。
     cur = pd.read_csv(DATA_DIR / "demo_universe.csv", dtype={"code": str})
     cur["code"] = cur["code"].str.zfill(6)
-    keymap = cur.set_index("code")
     for _, r in cur.iterrows():
         c = r["code"]
         mask = out["code"] == c
@@ -103,6 +130,7 @@ def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
         out.loc[mask, "float_shares"] = float(r["total_shares"]) * float(r["iwf"])
         out.loc[mask, "total_mcap"] = out.loc[mask, "price"] * float(r["total_shares"])
         out.loc[mask, "float_mcap"] = out.loc[mask, "price"] * out.loc[mask, "float_shares"]
+        out.loc[mask, "shares_source"] = "reference"
     return out
 
 

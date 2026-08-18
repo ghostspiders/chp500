@@ -56,6 +56,7 @@ def load_summary(universe: str) -> dict:
     top5 = float(w.nlargest(5).sum())
     top10 = float(w.nlargest(10).sum())
     top20 = float(w.nlargest(20).sum())
+    top30 = float(w.nlargest(30).sum())
     hhi = float((w ** 2).sum())
     eff_n = float(1.0 / hhi) if hhi > 0 else 0.0
 
@@ -119,7 +120,7 @@ def load_summary(universe: str) -> dict:
     if "profit_source" in c.columns:
         src["profit"] = {str(k): int(v) for k, v in c["profit_source"].value_counts().items()}
     n_all = max(len(c), 1)
-    real_shares = (src["shares"].get("em", 0) + src["shares"].get("reference", 0)) / n_all
+    real_shares = src["shares"].get("em", 0) / n_all
     real_profit = (src["profit"].get("em", 0) + src["profit"].get("edgar", 0)) / n_all
 
     return {
@@ -129,7 +130,7 @@ def load_summary(universe: str) -> dict:
         "n_universe": int(meta.get("n_universe", 0)),
         "n_eligible": int(meta.get("n_eligible", len(c))),
         "concentration": {
-            "top1": top1, "top5": top5, "top10": top10, "top20": top20,
+            "top1": top1, "top5": top5, "top10": top10, "top20": top20, "top30": top30,
             "hhi": hhi, "effective_n": eff_n,
         },
         "sectors": sector_list,

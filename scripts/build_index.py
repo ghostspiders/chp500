@@ -2,7 +2,7 @@
 
 用法:
   python scripts/build_index.py --mode demo --as-of 2026-08-13
-  python scripts/build_index.py --mode live   # 生产：需东财市值可达 / 配 Tushare
+  python scripts/build_index.py --mode live   # 生产：需东财市值主机可达
 
 输出（默认 outputs/）:
   constituents.csv   本期成分（含权重、行业、达标诊断）
@@ -47,7 +47,7 @@ def build_snapshot(as_of, mode, markets, universe="curated"):
         universe = adapters.fetch_a_universe()
         mcap = adapters.fetch_a_market_cap_em()
         # TODO: 合并 quotes / earnings / liquidity（见 adapters 各函数）
-        raise NotImplementedError("live 模式需东财市值主机可达；本环境被墙，请用 demo 或配 Tushare。")
+        raise NotImplementedError("live 模式需东财市值主机可达；本环境被墙，请用 demo。")
 
 
 def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
@@ -167,7 +167,7 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
         "shares_source_counts": {str(k): int(v) for k, v in src_shares.items()},
         "profit_source_counts": {str(k): int(v) for k, v in src_profit.items()},
         "real_shares_ratio": round(
-            (src_shares.get("em", 0) + src_shares.get("reference", 0)) / n_total, 4
+            src_shares.get("em", 0) / n_total, 4
         ),
         "real_profit_ratio": round(
             (src_profit.get("em", 0) + src_profit.get("edgar", 0)) / n_total, 4

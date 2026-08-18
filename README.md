@@ -16,7 +16,7 @@
 | Phase 1 | ✅ 已完成 | 方法论文档 + 落地蓝图 |
 | Phase 2 | ✅ 核心已实现 | 数据层 + 编制流水线 + 指数序列 + 可视化看板 + 回测（**A + 港股中资 + 美股中概 ADR 跨市场 demo 跑通**）|
 
-> 当前仓库已包含**可运行的编制流水线**（demo 模式）。完整覆盖 A+HK+ADR 需在生产环境（东财市值主机可达或配 Tushare）启用。
+> 当前仓库已包含**可运行的编制流水线**（demo 模式）。完整覆盖 A+HK+ADR 需在生产环境（东财市值主机可达）启用。
 
 ---
 
@@ -33,10 +33,10 @@
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 编制一期成分 + 指数序列（用本环境可用接口 + 静态份额参考）
+# 编制一期成分 + 指数序列（真实数据源；东财 push2 需国内网络/VPN）
 python scripts/build_index.py --mode demo --as-of 2026-08-13
 
-# 扩展宇宙：全量 A 股(真实名/价/利+近似股本)+港股/美股参考，推向 ~500 成分
+# 扩展宇宙：全量 A 股(真实名/价/利+东财 push2 真实股本)+港股/美股参考，推向 ~500 成分
 python scripts/build_index.py --mode demo --universe expanded --as-of 2026-08-13 --out-dir outputs/expanded
 
 # 绩效统计
@@ -95,7 +95,7 @@ chp500/
 frontend/                        # 静态前端：index.html / app.js / style.css（Plotly.js CDN）
 scripts/                         # serve.py / build_index.py / backtest.py
 tests/                           # 单元测试（pytest，离线运行）
-data/demo_universe.csv           # 演示用静态份额参考（近似，标注 illustrative）
+data/demo_universe.csv           # 精选 A 股成分定义（entity_id/上市日）；股本以真实数据源为准
 ```
 
 ## 运行测试
@@ -106,6 +106,18 @@ pytest
 ```
 
 测试全部离线运行（不触网），覆盖筛选/权重/行业/合并/指数序列/委员会/缓存/API 等核心模块。
+
+## 验证东财 push2 数据源闭环
+
+`scripts/verify_em_push2.py` 用于确认「东财 push2 真实市值/股本」闭环是否接通：
+
+```bash
+python scripts/verify_em_push2.py --as-of 2026-08-13
+# 扩展宇宙：python scripts/verify_em_push2.py --universe expanded --markets A,HK,US
+```
+
+- **国内网 / VPN 环境**：东财 push2 可达，A/HK/US 的 `shares_source=em` 占多数（未命中者标记 `missing` 由筛选剔除），`real_shares_ratio` 接近 1 —— 闭环成立。
+- **东财不可达环境**：构建会**直接报错终止**（严格真实模式，无近似回落）；报告落盘 `outputs/em_push2_verify.json` 仅含可达性探测结果。
 
 ---
 
@@ -123,24 +135,38 @@ pytest
 | 数据项 | A 股 | 港股中资 | 美股中概 |
 |---|---|---|---|
 | 历史日线（价格/成交量） | 新浪（前复权） | 新浪 | 新浪 |
-| 总市值/流通市值/股本/IWF | 东财 push2 快照（真实） | 东财 push2 快照（真实） | 东财 push2 快照（真实） |
+| 总市值/流通市值/股本/IWF | 东财 push2 真实快照（需 VPN） | 东财 push2 快照（真实） | 东财 push2 快照（真实） |
 | TTM/最新单季净利 | 东财 yjbb_em（真实） | 东财港股财报（真实，按披露期拼 TTM） | SEC EDGAR（真实，权威） |
 | 汇率 | 央行中间价（真实） | 同左 | 同左 |
 
-- IWF 口径为**流通市值/总市值**近似（不含战略持股扣减）；`demo_universe.csv` 中 43 只蓝筹的人工核定自由流通值（如大行 0.2）优先覆盖（`shares_source=reference`）。
-- **东财 push2 / 东财港股财报需国内网络或 VPN**；断网自动降级：A 股回落合成股本（`synthetic`）、港/美回落静态参考（`static`），产物列与看板状态行标注真实数据覆盖率，**绝不静默混用**。
+- IWF 口径为**流通市值/总市值**近似（不含战略持股扣减），三市场一致由东财 push2 真实快照提供；`demo_universe.csv` 仅提供 A 股蓝筹的跨市场 `entity_id` 与上市日，不作股本/市值回落源。
 - 港股财报金额按报告货币取值，中资股绝大多数以 CNY 报告，个别 USD 报告者（如中芯国际）存在未折算偏差；半年披露制下"最新单季"有季度披露时精确差分，否则按天数比例折算。美股 EDGAR 同理处理财年错位（如阿里 3 月财年）。
-- 每个成分在 `constituents.csv` 中带 `shares_source` / `profit_source` 列（em/edgar/reference/static/synthetic）。
+- 每个成分在 `constituents.csv` 中带 `shares_source` / `profit_source` 列：`em`（东财 push2 真实）、`edgar`（SEC EDGAR 真实）、`missing`（真实源未覆盖，由筛选剔除）。
+- **严格真实模式（无近似回落）**：所有市值/股本/IWF 来自东财 push2 真实快照，净利润来自 `stock_yjbb_em`（A）/ 东财港股财报（HK）/ SEC EDGAR（US）；**任一真实源不可达，构建直接报错终止**，绝不输出参考/合成/静态近似。本地 `demo_*.csv` 仅作成分定义与跨市场 `entity_id` 映射（去重），HK/US 行业/上市日由真实接口推导（取不到真实行业则剔除该成分）。
+
+## 已接入数据源清单
+
+实际接入的数据源如下（**未使用 Tushare**），每项均标注可达性与不可达时的处理：
+
+| 数据源 | 接入位置 | 覆盖字段 | 可达性 | 不可达时处理 |
+|---|---|---|---|---|
+| **AkShare / 新浪行情** | `adapters.fetch_a_quotes_sina` · `fetch_hk_us_hist` | A/HK/US 现价、前复权日线、成交量、ADTV | ✅ 直连可达 | — |
+| **东财 `stock_yjbb_em`** | `adapters.fetch_a_earnings` | A 股 TTM/最新单季净利润、行业 | ✅ 直连可达 | — |
+| **东财 push2 实时快照** | `em_snapshot.get_em_spot`（A/HK/US） | 真实总/流通市值、总股本、流通股本、IWF | ⚠️ 需国内网络或 VPN | **报错终止** |
+| **SEC EDGAR** | `edgar.fetch_us_net_income` | 美股中概 ADR 的 TTM/单季净利润 | ✅ 免费免认证、权威 | — |
+| **中行汇率** | `fx.currency_boc_sina` | USD/HKD 央行中间价（/100） | ✅ 直连可达 | — |
+| **本地成分定义** | `data/demo_*.csv` | 成分定义、跨市场 `entity_id` 映射（去重，不含任何份额/盈利/行业/上市日近似值） | ✅ 本地 | — |
+
+HK/US 行业与上市日不再以静态字段提供，改由真实接口推导（见上方「严格真实模式」）；成分定义见 `data/demo_*.csv`。
 
 ## 已知限制（重要，使用须知）
 
-1. **数据源环境依赖**：新浪行情/汇率主机直连可达；东财 push2（市值/股本/港股财报）需国内网络或 VPN，断线自动降级并标记（见上方数据源矩阵）。**生产模式**（`--mode live`）仍未实现，可基于现有东财快照通路补齐。
-2. **演示份额/盈利为近似（标注 illustrative）**：`data/demo_universe.csv`（A）、`data/demo_hk.csv`、`data/demo_us.csv`（中资港股/中概 ADR）中的总股本、IWF、TTM 净利润、行业为**近似参考**，用于跑通跨市场流程；生产应取实时自由流通股本与审计财报。HK/US 仅覆盖约 40+ 只代表性中资股（非全量）。扩展宇宙（`--universe expanded`）中 A 股的**公司名、现价、TTM 净利润、行业、流动性为真实值**（Sina / yjbb_em 抓取），仅**总股本与 IWF 为贴近真实 A 股规模分布的合成近似**（本沙箱不可达东财实时股本）。
-3. **跨市场合并规则（去重、不重复计入）**：同一经济主体若同时在 A/港股/ADR 上市，按**主上市地优先级 A > HK > US** 计为单一成分（与 MSCI/FTSE 全球指数一致，避免跨市场重复计入）。仅在某市场挂牌的主体（如腾讯仅在港股、拼多多仅在美国）则按该市场计价并做多币种折算——此即「全域覆盖」的实现。实体映射键为各参考表的 `entity_id` 列。
-4. **流动性阈值按市场分设**：A 股"6 个月累计成交量/自由流通股"的全额周转口径对大市值股（如大行）普遍失真，且扩展宇宙的自由流通股为合成近似，故 A 股下限仅设为 `0.02`（仅剔除近零成交的失真/僵尸样本）；港股/美股换手率结构更低，沿用 `0.30`，避免误杀中资港股/中概 ADR。分市场下限见 `config.yaml: liquidity_ratio_min_by_market`。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
-5. **指数序列处理**：历史行情用**前复权(qfq)** 价格以保证连续；跨源偶有缺失交易日，按「个股最新已知价向前填充(ffill)」对齐，避免成分缺数导致指数无谓跳变。全收益指数当前**未含分红**（== 价格指数），接分红数据后即分叉。
-6. **Sina 限流/瞬时失败**：`stock_hk_daily`/`stock_us_daily` 偶发返回空表/缺字段，适配器已做 3 次重试与字段校验；历史行情按 `code` 缓存于 `.cache/`（parquet），有效期由 `cache_ttl_days`（默认 7 天）控制，过期自动重取，重跑可加速并提升稳定性。
-7. **两种宇宙规模可选**：`--universe curated`（默认，约 60 只精选参考：A 蓝筹 + 港股中资 + 中概 ADR）与 `--universe expanded`（全量 A 股 + 港股/美股参考集，目标推向 ~500）。扩展模式下 A 股真实字段同上，但总股本/IWF 为合成近似，故点位与权重为**演示性**：用于验证大规模下的行业平衡、集中度与再平衡机制；成分数量与排序会随合成种子 (`seed=42`) 与行情日而变。扩展 A 股宇宙可落盘查看：`python -c "from chp500.data.universe import persist_expanded_a_universe; persist_expanded_a_universe('2026-08-13')"` → `data/demo_universe_expanded.csv`。
+1. **数据源环境依赖**：新浪行情/汇率主机直连可达；东财 push2（市值/股本/港股财报）需国内网络或 VPN，不可达即报错终止（见上方「严格真实模式」）。**生产模式**（`--mode live`）仍未实现，可基于现有东财快照通路补齐。
+2. **跨市场合并规则（去重、不重复计入）**：同一经济主体若同时在 A/港股/ADR 上市，按**主上市地优先级 A > HK > US** 计为单一成分（与 MSCI/FTSE 全球指数一致，避免跨市场重复计入）。仅在某市场挂牌的主体（如腾讯仅在港股、拼多多仅在美国）则按该市场计价并做多币种折算——此即「全域覆盖」的实现。实体映射键为各参考表的 `entity_id` 列。
+3. **流动性阈值按市场分设**：A 股"6 个月累计成交量/自由流通股"的全额周转口径对大市值股（如大行）普遍失真，故 A 股下限仅设为 `0.02`（仅剔除近零成交的失真/僵尸样本）；港股/美股换手率结构更低，沿用 `0.30`，避免误杀中资港股/中概 ADR。分市场下限见 `config.yaml: liquidity_ratio_min_by_market`。盈利门槛（TTM 与最新单季净利>0）对全市场统一适用。
+4. **指数序列处理**：历史行情用**前复权(qfq)** 价格以保证连续；跨源偶有缺失交易日，按「个股最新已知价向前填充(ffill)」对齐，避免成分缺数导致指数无谓跳变。全收益指数当前**未含分红**（== 价格指数），接分红数据后即分叉。
+5. **Sina 限流/瞬时失败**：`stock_hk_daily`/`stock_us_daily` 偶发返回空表/缺字段，适配器已做 3 次重试与字段校验；历史行情按 `code` 缓存于 `.cache/`（parquet），有效期由 `cache_ttl_days`（默认 7 天）控制，过期自动重取，重跑可加速并提升稳定性。
+6. **两种宇宙规模可选**：`--universe curated`（默认，约 60 只精选参考：A 蓝筹 + 港股中资 + 中概 ADR）与 `--universe expanded`（全量 A 股 + 港股/美股参考集，目标推向 ~500）。两种模式股本/市值均来自东财 push2 真实快照（需 VPN），点位与权重用于验证大规模下的行业平衡、集中度与再平衡机制；扩展 A 股宇宙可落盘查看：`python -c "from chp500.data.universe import persist_expanded_a_universe; persist_expanded_a_universe('2026-08-13')"` → `data/demo_universe_expanded.csv`。
 
 ---
 

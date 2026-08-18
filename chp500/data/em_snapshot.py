@@ -8,14 +8,16 @@
 汇率折算由调用方（adapters/universe）处理。
 
 网络约束：东财 push2 主机需国内网络或 VPN；任一页失败重试 3 次后整体
-返回 None，调用方必须降级（回落静态/合成值并标记 shares_source）。
+返回 None，调用方须报错终止（严格真实模式，绝不回落静态/合成近似）。
 """
 
 from __future__ import annotations
 
+import re
 import time
 
 import pandas as pd
+import requests
 
 from ..config import CONFIG
 from .cache import Cache
@@ -83,7 +85,7 @@ def _parse_rows(diff: list) -> list[dict]:
 
 
 def fetch_em_spot(market: str) -> pd.DataFrame | None:
-    """分页拉取全市场快照；失败返回 None（调用方降级）。"""
+    """分页拉取全市场快照；失败返回 None（调用方须报错终止，绝不回落近似）。"""
     if market not in _MARKET_CFG:
         raise ValueError(f"unknown market: {market}")
     host, fs = _MARKET_CFG[market]
@@ -106,6 +108,98 @@ def fetch_em_spot(market: str) -> pd.DataFrame | None:
     return pd.DataFrame(rows, columns=_COLUMNS)
 
 
-def get_em_spot(market: str) -> pd.DataFrame | None:
-    """带缓存的市场快照（缓存 miss 且抓取失败时返回 None）。"""
-    return _CACHE.get_or_fetch(f"em_spot_{market}", fetch_em_spot, market)
+def _tencent_symbol(code: str, market: str) -> str:
+    """把内部代码映射为腾讯 qt 查询符号（sh/sz/hk/us 前缀）。"""
+    code = str(code).strip()
+    if market == "A":
+        return ("sh" + code) if code[:1] == "6" else ("sz" + code)
+    if market == "HK":
+        return "hk" + code.zfill(5)
+    return "us" + code.upper()
+
+
+def _tencent_clean_code(key: str, market: str) -> str:
+    """从腾讯返回键（sh600519 / hk00700 / usBABA）提取内部代码。"""
+    if market == "US":
+        return key[2:].upper()
+    return re.sub(r"[^0-9]", "", key)
+
+
+def fetch_fallback_spot(market: str, codes) -> pd.DataFrame | None:
+    """腾讯行情兜底：用 qt.gtimg.cn 取总市值/流通市值（亿，本币），折算为元。
+
+    仅在市值/股本字段可用时计入；东财不可达时作为严格真实模式的兜底源，
+    不再回落合成/静态近似。返回列与东财快照一致：
+    code, name, price, total_mcap_local, float_mcap_local。
+    """
+    tq = [_tencent_symbol(c, market) for c in codes]
+    rows = []
+    for i in range(0, len(tq), 150):
+        chunk = tq[i:i + 150]
+        try:
+            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(chunk), timeout=25)
+            txt = r.content.decode("gbk", "ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        for line in txt.split(";"):
+            m = re.match(r'v_(\w+)="(.*)"', line.strip())
+            if not m:
+                continue
+            f = m.group(2).split("~")
+            if len(f) <= 45:
+                continue
+            try:
+                price = float(f[3])
+                tm = float(f[44])
+                fm = float(f[45])
+            except (ValueError, IndexError):
+                continue
+            if price <= 0 or tm <= 0 or fm <= 0:
+                continue
+            rows.append({
+                "code": _tencent_clean_code(m.group(1), market),
+                "name": f[1],
+                "price": price,
+                # 腾讯市值字段单位为"亿（本币）"，折算为元以与东财快照单位一致
+                "total_mcap_local": tm * 1e8,
+                "float_mcap_local": fm * 1e8,
+            })
+    if not rows:
+        return None
+    return pd.DataFrame(rows, columns=["code", "name", "price",
+                                       "total_mcap_local", "float_mcap_local"])
+
+
+def _full_a_codes():
+    from . import adapters
+    return adapters.fetch_a_universe()["code"].astype(str).tolist()
+
+
+def _full_hk_codes():
+    import akshare as ak
+    return ak.stock_hk_spot()["代码"].astype(str).tolist()
+
+
+def get_em_spot(market: str, codes=None) -> pd.DataFrame | None:
+    """市场快照：优先东财 push2（严格真实），不可达时回退腾讯行情（含市值）。
+
+    - 东财可达：返回其全市场快照（codes 参数忽略）。
+    - 东财不可达：用腾讯 qt.gtimg.cn 兜底；codes 为需覆盖的代码列表。
+      未提供时 A/HK 自动取全量列表，US 必须提供（否则报错）。
+    返回 None 表示所有来源均不可用，调用方应报错终止。
+    """
+    em = fetch_em_spot(market)
+    if em is not None and not em.empty:
+        return em
+    # 东财不可达 → 腾讯兜底
+    if codes is None:
+        if market == "A":
+            codes = _full_a_codes()
+        elif market == "HK":
+            codes = _full_hk_codes()
+        else:
+            raise RuntimeError(
+                "东财 push2（US 快照）不可达且未提供 US 参考代码，腾讯兜底失败。"
+            )
+    print(f"[em] 东财 push2 不可达，使用腾讯行情兜底（{market}，{len(codes)} 只）")
+    return fetch_fallback_spot(market, list(codes))

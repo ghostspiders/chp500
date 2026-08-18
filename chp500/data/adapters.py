@@ -8,7 +8,7 @@
   - stock_hk_daily           : Sina 港股日线（可用，港股无东财墙）
   - stock_us_daily           : Sina 美股日线（可用）
   - currency_boc_sina        : 中行历史汇率（USD/HKD -> CNY，可用）
-  - stock_financial_hk_report_em : 港股三大报表（需国内网络/VPN；断线自动降级）
+  - stock_financial_hk_report_em : 港股三大报表（需国内网络/VPN；不可达报错终止）
   另见 em_snapshot.py（东财 push2 三市场市值/股本快照，需国内网络/VPN）
   与 edgar.py（SEC EDGAR 美股净利，免认证）。
 """
@@ -19,9 +19,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import re
+import time
+
 import akshare as ak
 import numpy as np
 import pandas as pd
+import requests
 
 from ..config import BASE_DIR, CONFIG
 from . import edgar, fx
@@ -32,6 +36,10 @@ from .ttm_periods import compute_ttm_from_periods
 
 DATA_DIR = BASE_DIR / "data"
 CACHE = Cache()
+
+# 业绩抓取结果完整性护栏：9 个报告期 × ~5500 只 ≈ 4.5~6 万行；低于此值视为东财
+# yjbb_em 返回残缺，不缓存（下次重新抓取）。
+_EARN_MIN_ROWS = 30000
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +55,64 @@ def fetch_a_universe() -> pd.DataFrame:
 
 
 def fetch_a_quotes_sina() -> pd.DataFrame:
-    """Sina 批量现价与成交量（无市值）。代码列为 6 位字符串。"""
+    """A 股批量现价（及成交量）。优先 Sina，失败回退腾讯行情（本环境 Sina 偶发被拦截）。
+
+    下游仅消费 price 列；volume/amount 在回退时置空。
+    """
+    last_err = None
+    for _ in range(3):
+        try:
+            return _fetch_a_quotes_sina_impl()
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}:{e}"[:120]
+            time.sleep(3)
+    print(f"[warn] Sina 行情获取失败（{last_err}），回退腾讯行情")
+    return _fetch_a_quotes_tencent()
+
+
+def _fetch_a_quotes_sina_impl() -> pd.DataFrame:
     df = ak.stock_zh_a_spot()
     df = df.rename(columns={"代码": "code", "名称": "name", "最新价": "price",
                             "成交量": "volume", "成交额": "amount"})
     # Sina 代码带交易所前缀（sh/sz/bj），提取 6 位数字
     df["code"] = df["code"].astype(str).str.extract(r"(\d{6})")[0]
-    return df[["code", "name", "price", "volume", "amount"]]
+    df = df[["code", "name", "price", "volume", "amount"]]
+    # 校验：Sina 偶发返回残缺/异常（如仅北交所部分、或 HTML 误解析），
+    # 视为不可用，触发上层回退腾讯行情。
+    if len(df) < 1000 or df["price"].isna().all():
+        raise ValueError(f"Sina 行情记录数异常/无价格: {len(df)} 行")
+    return df
+
+
+def _fetch_a_quotes_tencent() -> pd.DataFrame:
+    """腾讯 qt 兜底：取全 A 现价（本环境比 Sina 稳定）。仅保证 code/name/price。"""
+    info = ak.stock_info_a_code_name()
+    codes = info["code"].astype(str).tolist()
+    tq = [("sh" + c) if c[:1] == "6" else ("sz" + c) for c in codes]
+    rows = []
+    for i in range(0, len(tq), 150):
+        try:
+            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(tq[i:i + 150]), timeout=25)
+            txt = r.content.decode("gbk", "ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        for line in txt.split(";"):
+            m = re.match(r'v_(\w+)="(.*)"', line.strip())
+            if not m:
+                continue
+            f = m.group(2).split("~")
+            if len(f) <= 3:
+                continue
+            try:
+                price = float(f[3])
+            except (ValueError, IndexError):
+                continue
+            if price <= 0:
+                continue
+            rows.append({"code": re.sub(r"[^0-9]", "", m.group(1)),
+                         "name": f[1], "price": price,
+                         "volume": float("nan"), "amount": float("nan")})
+    return pd.DataFrame(rows, columns=["code", "name", "price", "volume", "amount"])
 
 
 # ---------------------------------------------------------------------------
@@ -80,17 +139,33 @@ def _quarter_ends(upto: datetime, n: int = 9) -> list[str]:
     return ends  # 由近到远
 
 
-def fetch_a_earnings(as_of: datetime | None = None, dates: list[str] | None = None) -> pd.DataFrame:
+def fetch_a_earnings(as_of: datetime | None = None, dates: list[str] | None = None, force: bool = False) -> pd.DataFrame:
     """批量抓取多个报告期的净利润与行业，返回长表。
 
     列：code, date(报告期), net_profit, industry。
+
+    东财 yjbb_em 偶发被拦截/返回残缺数据，故加 7 天缓存：首次抓到"完整"结果
+    （行数 >= _EARN_MIN_ROWS）即落盘，后续 7 天内直接复用，避免构建时撞上东财
+    间歇不可用而只剩零星成分。残缺结果（< 阈值）不缓存，下次重新抓取。
     """
     as_of = pd.Timestamp(as_of or datetime.now())
     if dates is None:
         dates = _quarter_ends(as_of, n=9)
+    cache_key = f"a_earnings_{as_of.date()}"
+    if not force:
+        cached = CACHE.get(cache_key)
+        if cached is not None and len(cached) >= _EARN_MIN_ROWS:
+            return cached
     rows = []
     for dt in dates:
-        df = ak.stock_yjbb_em(date=dt)
+        df = None
+        for _ in range(3):  # 东财 yjbb_em 偶发被拦截，重试
+            try:
+                df = ak.stock_yjbb_em(date=dt)
+                if df is not None and not df.empty:
+                    break
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
         if df is None or df.empty:
             continue
         sub = df[["股票代码", "净利润-净利润", "所处行业"]].copy()
@@ -100,7 +175,11 @@ def fetch_a_earnings(as_of: datetime | None = None, dates: list[str] | None = No
         rows.append(sub)
     if not rows:
         return pd.DataFrame(columns=["code", "date", "net_profit", "industry"])
-    return pd.concat(rows, ignore_index=True)
+    out = pd.concat(rows, ignore_index=True)
+    # 仅当结果看起来完整时才缓存（覆盖旧的可能残缺缓存）
+    if len(out) >= _EARN_MIN_ROWS:
+        CACHE.put(cache_key, out)
+    return out
 
 
 def compute_ttm_earnings(earnings_long: pd.DataFrame, as_of: datetime | None = None) -> pd.DataFrame:
@@ -303,7 +382,7 @@ def fetch_hk_us_hist(codes, market: str, start: str, end: str, workers: int = 12
 
 
 # ---------------------------------------------------------------------------
-# 生产用市值（东财实时主机，本环境被墙；生产/ Tushare 时启用）
+# 生产用市值（东财实时主机，本环境被墙；生产环境启用）
 # ---------------------------------------------------------------------------
 def fetch_a_market_cap_em() -> pd.DataFrame:
     """东财批量市值。本环境会被防火墙 RESET，生产环境可用。"""
@@ -317,7 +396,14 @@ def fetch_a_market_cap_em() -> pd.DataFrame:
 # 各市场 listing 级快照
 # ---------------------------------------------------------------------------
 def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
-    """A 股 listing 级快照（现价 Sina，净利润/行业 yjbb_em，流动性 Sina daily）。"""
+    """A 股 listing 级快照（严格真实模式）。
+
+    - 市值/股本/IWF：东财 push2 真实快照（需国内网络/VPN），不可达直接报错终止；
+    - 现价：Sina（与东财快照价一致，作为基准），东财将覆盖为权威价；
+    - 净利润/行业：东财 yjbb_em 真实财报；
+    - 流动性：Sina daily 成交量 / 东财真实自由流通股。
+    不再有任何近似回落（reference/synthetic/static）。
+    """
     from ..sector.classifier import map_to_sector
 
     as_of = pd.Timestamp(as_of or datetime.now())
@@ -333,31 +419,36 @@ def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
     start = (as_of - timedelta(days=200)).strftime("%Y%m%d")
     end = as_of.strftime("%Y%m%d")
     _, volumes = fetch_hist(ref["code"].tolist(), start, end)
-    float_shares = ref.set_index("code")["total_shares"] * ref.set_index("code")["iwf"]
-    liq = compute_liquidity(volumes, float_shares)
 
-    out = ref.copy()
-    out["entity_id"] = ref["entity_id"]
-    out["market"] = "A"
-    out["curr"] = "CNY"
-    out["is_st"] = out["name"].str.contains("ST", case=False, na=False)
-    out["is_china"] = True
+    em = get_em_spot("A", codes=ref["code"].astype(str).tolist())
+    if em is None or em.empty:
+        raise RuntimeError(
+            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，构建已终止。"
+        )
+
+    out = pd.DataFrame({
+        "entity_id": ref["entity_id"].values,
+        "code": ref["code"].values,
+        "name": ref["name"].values,
+        "market": "A",
+        "curr": "CNY",
+        "is_st": ref["name"].str.contains("ST", case=False, na=False).values,
+        "is_china": True,
+        "listing_date": pd.to_datetime(ref["listing_date"]).values,
+    })
     out["price"] = out["code"].map(qmap["price"])
-    out["total_shares"] = out["total_shares"].astype(float)
-    out["iwf"] = out["iwf"].astype(float)
-    out["float_shares"] = out["total_shares"] * out["iwf"]
-    out["total_mcap_local"] = out["price"] * out["total_shares"]
-    out["float_mcap_local"] = out["price"] * out["float_shares"]
-    out["total_mcap"] = out["total_mcap_local"]  # A 股本币即 CNY
-    out["float_mcap"] = out["float_mcap_local"]
     out["ttm_net_profit"] = out["code"].map(earn.set_index("code")["ttm_net_profit"])
     out["latest_q_net_profit"] = out["code"].map(earn.set_index("code")["latest_q_net_profit"])
     out["industry"] = out["code"].map(earn.set_index("code")["industry"])
     out["sector"] = out["industry"].map(map_to_sector)
+
+    # 东财 push2 真实市值/股本（严格：不可达已在上游报错，绝不回落参考/合成）
+    out = apply_em_shares_local(out, em, fxr=1.0)
+
+    float_shares_series = pd.Series(out["float_shares"].values, index=out["code"].values)
+    liq = compute_liquidity(volumes, float_shares_series)
     out["liquidity_ratio"] = out["code"].map(liq)
-    out["listing_date"] = pd.to_datetime(out["listing_date"])
-    out["shares_source"] = "reference"  # 人工核定参考股本（自由流通口径）
-    out["profit_source"] = "em"  # yjbb 真实财报
+    out["profit_source"] = "em"
     return out
 
 
@@ -397,45 +488,57 @@ def fetch_hk_profit_periods(code: str):
 
 
 def apply_em_shares_local(out: pd.DataFrame, em: pd.DataFrame | None, fxr: float) -> pd.DataFrame:
-    """用东财快照覆盖 HK/US listing 的价格/股本/市值（本币与 CNY），标记 shares_source。
+    """用东财 push2 真实快照覆盖价格/股本/市值（本币与 CNY），标记 shares_source=em。
 
-    em 为 None 或个股缺失时保留静态参考值（shares_source=static）。
+    严格模式：em 不可达（None/空）直接抛出 RuntimeError，绝不降级到参考/合成/静态近似值。
+    个股未命中（停牌/未收录）标记 shares_source="missing" 并将市值/股本置 NaN，
+    由下游筛选剔除（不做近似回填）。
     """
-    out = out.copy()
-    out["shares_source"] = "static"
     if em is None or em.empty:
-        return out
+        raise RuntimeError(
+            "东财 push2 快照不可达（需国内网络/VPN）：无法获取真实市值/股本，已终止以避免使用近似数据。"
+        )
+    out = out.copy()
     m = em.set_index("code")
     hit = out["code"].isin(m.index)
     idx = out.index[hit]
     if not len(idx):
-        return out
+        raise RuntimeError("东财 push2 快照未覆盖任何成分代码，无法获取真实市值/股本。")
     price = out.loc[idx, "code"].map(m["price"]).astype(float)
     tm = out.loc[idx, "code"].map(m["total_mcap_local"]).astype(float)
     fm = out.loc[idx, "code"].map(m["float_mcap_local"]).astype(float)
     valid = price > 0
     idx = idx[valid]
     price, tm, fm = price[valid], tm[valid], fm[valid]
-    out.loc[idx, "price"] = price.values
-    out.loc[idx, "total_shares"] = (tm / price).values
-    out.loc[idx, "float_shares"] = (fm / price).values
-    out.loc[idx, "iwf"] = (fm / tm).values
-    out.loc[idx, "total_mcap_local"] = tm.values
-    out.loc[idx, "float_mcap_local"] = fm.values
-    out.loc[idx, "total_mcap"] = (tm * fxr).values  # 折算 CNY
-    out.loc[idx, "float_mcap"] = (fm * fxr).values
+    out.loc[idx, "price"] = price
+    out.loc[idx, "total_shares"] = tm / price
+    out.loc[idx, "float_shares"] = fm / price
+    out.loc[idx, "iwf"] = fm / tm
+    out.loc[idx, "total_mcap_local"] = tm
+    out.loc[idx, "float_mcap_local"] = fm
+    out.loc[idx, "total_mcap"] = tm * fxr  # 折算 CNY
+    out.loc[idx, "float_mcap"] = fm * fxr
     out.loc[idx, "shares_source"] = "em"
+    # 未命中个股：无真实市值/股本，置缺失并标记，下游筛选自然剔除（不回填近似）。
+    uncovered = out.index.difference(idx)
+    out.loc[uncovered, ["total_shares", "float_shares", "iwf",
+                        "total_mcap_local", "float_mcap_local",
+                        "total_mcap", "float_mcap"]] = np.nan
+    out.loc[uncovered, "shares_source"] = "missing"
     return out
 
 
 def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.DataFrame:
     """用真实财务源覆盖 TTM/最新单季：HK=东财港股财报，US=SEC EDGAR。
 
-    调用前 out 已含静态兜底值（ttm_net_profit / latest_q_net_profit）。
-    失败个股保留静态并标 profit_source=static。
+    严格模式：失败个股标记 profit_source="missing" 并将净利润置 NaN，由下游盈利筛选剔除；
+    不再回落静态近似值。若整批均无真实财务（源整体不可用），抛出 RuntimeError。
     """
     out = out.copy()
-    out["profit_source"] = "static"
+    out["ttm_net_profit"] = np.nan
+    out["latest_q_net_profit"] = np.nan
+    out["profit_source"] = "missing"
+    got_real = False
     for i, r in out.iterrows():
         try:
             if market == "HK":
@@ -445,24 +548,74 @@ def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.Da
                     out.loc[i, "ttm_net_profit"] = res["ttm"]
                     out.loc[i, "latest_q_net_profit"] = res["latest_q"]
                     out.loc[i, "profit_source"] = "em"
+                    got_real = True
             else:
                 res = edgar.fetch_us_net_income(r["code"], usd_cny=usd_cny)
                 if res is not None:
                     out.loc[i, "ttm_net_profit"] = res["ttm"]
                     out.loc[i, "latest_q_net_profit"] = res["latest_q"]
                     out.loc[i, "profit_source"] = "edgar"
+                    got_real = True
         except Exception:  # noqa: BLE001
             continue
+    if not got_real:
+        raise RuntimeError(
+            f"{market} 真实财务源整体不可用（东财港股财报 / SEC EDGAR）：无法获取真实净利润，构建已终止。"
+        )
     return out
 
 
-def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: pd.DataFrame) -> pd.DataFrame:
-    """港股/美股 listing 级快照。
+def fetch_hk_us_sector(codes, market: str) -> dict:
+    """真实行业（Xueqiu 个股 basic info），返回 {code: 行业中文}。
 
-    - 股本/市值：东财 push2 真实快照（需国内网络/VPN），缺失回落 demo CSV 静态参考；
-    - 财务：HK=东财港股财报（TTM+单季），US=SEC EDGAR；失败回落静态；
-    - 现价/成交量：Sina daily（东财不可达时价格仍以 Sina 为准，股本按静态计）。
+    严格模式：无静态兜底。任一股票取不到真实行业则不计入（由 build_* 剔除）。
     """
+    import akshare as ak
+
+    func = ak.stock_individual_basic_info_hk_xq if market == "HK" else ak.stock_individual_basic_info_us_xq
+    out: dict = {}
+    for c in codes:
+        try:
+            df = func(symbol=str(c))
+        except Exception:  # noqa: BLE001
+            continue
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            continue
+        rec: dict = {}
+        if isinstance(df, pd.DataFrame) and {"item", "value"}.issubset(df.columns):
+            rec = dict(zip(df["item"].astype(str), df["value"].astype(str)))
+        for col in ("行业", "板块", "industry", "sector"):
+            if col in getattr(df, "columns", []):
+                val = df[col].iloc[0]
+                if pd.notna(val):
+                    rec.setdefault("industry", str(val))
+        ind = rec.get("行业") or rec.get("板块") or rec.get("industry") or rec.get("sector")
+        if ind:
+            out[str(c)] = str(ind)
+    return out
+
+
+def _first_listed_date(code: str, market: str) -> pd.Timestamp:
+    """真实上市日：由 Sina 全量日线首日推导（缓存命中，无需另抓历史）。"""
+    df = _cached_hk_us_daily(str(code), market)
+    if df is None or df.empty:
+        return pd.NaT
+    s = df["date"].dropna()
+    return s.min() if not s.empty else pd.NaT
+
+
+def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: pd.DataFrame) -> pd.DataFrame:
+    """港股/美股 listing 级快照（严格真实模式）。
+
+    - 行业：真实 Xueqiu 个股行业（无静态兜底），取不到真实行业的股票直接剔除；
+    - 上市日：真实 Sina 全量日线首日推导（无静态兜底）；
+    - 股本/市值：东财 push2 真实快照（需国内网络/VPN），不可达直接报错终止；
+    - 财务：HK=东财港股财报（TTM+单季），US=SEC EDGAR；不可达/缺失标记 missing 由筛选剔除；
+    - 现价/成交量：Sina daily（价格与东财快照价一致）。
+    不再有任何近似回落（reference/synthetic/static）。
+    """
+    from ..sector.classifier import map_to_sector
+
     as_of = pd.Timestamp(as_of or datetime.now())
     fname = "demo_hk.csv" if market == "HK" else "demo_us.csv"
     curr = "HKD" if market == "HK" else "USD"
@@ -471,42 +624,55 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     codes = ref["code"].astype(str).tolist()
     prices = fetch_hk_us_price(codes, market, as_of)
 
+    # 真实行业（无静态兜底）：取不到真实行业的股票剔除
+    sec = fetch_hk_us_sector(codes, market)
+    keep = [c for c in codes if c in sec]
+    if not keep:
+        print(f"[warn] {market} 真实行业源整体不可用（无任一股票取得真实行业），该市场成分暂为空。")
+        return pd.DataFrame(columns=[
+            "entity_id", "code", "name", "market", "curr", "is_st", "is_china",
+            "price", "total_shares", "float_shares", "iwf", "total_mcap", "float_mcap",
+            "ttm_net_profit", "latest_q_net_profit", "industry", "sector",
+            "liquidity_ratio", "listing_date", "shares_source", "profit_source",
+        ])
+    ref = ref[ref["code"].astype(str).isin(keep)].copy()
+
     start = (as_of - timedelta(days=200)).strftime("%Y%m%d")
     end = as_of.strftime("%Y%m%d")
-    _, volumes = fetch_hk_us_hist(codes, market, start, end)
-    float_shares = pd.Series(
-        (ref["total_shares"].astype(float) * ref["iwf"].astype(float)).values,
-        index=ref["code"].astype(str).values,
-    )
-    liq = compute_liquidity(volumes, float_shares)
+    _, volumes = fetch_hk_us_hist(keep, market, start, end)
 
     fxr = fx.fx_rate_on(fx_table, as_of, curr)
+    em = get_em_spot(market, codes=ref["code"].astype(str).tolist())
+    if em is None or em.empty:
+        raise RuntimeError(
+            f"东财 push2（{market} 快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，构建已终止。"
+        )
 
-    out = ref.copy()
-    out["entity_id"] = ref["entity_id"]
-    out["market"] = market
-    out["curr"] = curr
-    out["is_st"] = out["name"].str.contains("ST", case=False, na=False)
-    out["is_china"] = True
+    out = pd.DataFrame({
+        "entity_id": ref["entity_id"].values,
+        "code": ref["code"].astype(str).values,
+        "name": ref["name"].values,
+        "market": market,
+        "curr": curr,
+        "is_st": ref["name"].str.contains("ST", case=False, na=False).values,
+        "is_china": True,
+    })
     out["price"] = out["code"].map(prices)
-    out["total_shares"] = out["total_shares"].astype(float)
-    out["iwf"] = out["iwf"].astype(float)
-    out["float_shares"] = out["total_shares"] * out["iwf"]
-    out["total_mcap_local"] = out["price"] * out["total_shares"]
-    out["float_mcap_local"] = out["price"] * out["float_shares"]
-    out["total_mcap"] = out["total_mcap_local"] * fxr  # 折算 CNY
-    out["float_mcap"] = out["float_mcap_local"] * fxr
-    out["ttm_net_profit"] = out["ttm_net_profit_cny"].astype(float)  # 静态兜底（已是 CNY）
-    out["latest_q_net_profit"] = out["ttm_net_profit"]  # 兜底近似：单季=TTM
-    out["sector"] = out["sector"]
-    out["industry"] = out["sector"]
-    out["liquidity_ratio"] = out["code"].map(liq)
-    out["listing_date"] = pd.to_datetime(out["listing_date"])
 
-    # 东财真实股本/市值覆盖（失败自动回落静态并标记）
-    out = apply_em_shares_local(out, get_em_spot(market), fxr)
-    # 真实财务覆盖（HK=东财财报 / US=EDGAR）
+    # 东财真实股本/市值（严格：不可达已在上游报错）
+    out = apply_em_shares_local(out, em, fxr)
+    # 真实财务覆盖（HK=东财财报 / US=SEC EDGAR）；缺失标记 missing，不回落静态
     out = apply_real_earnings(out, market, usd_cny=fx.fx_rate_on(fx_table, as_of, "USD"))
+
+    # 真实行业 + GICS 映射（行业取不到的已在上游剔除）
+    out["industry"] = out["code"].map(sec)
+    out["sector"] = out["industry"].map(map_to_sector)
+    # 真实上市日（Sina 全量日线首日推导）
+    out["listing_date"] = out["code"].map(lambda c: _first_listed_date(c, market))
+
+    float_shares_series = pd.Series(out["float_shares"].values, index=out["code"].values)
+    liq = compute_liquidity(volumes, float_shares_series)
+    out["liquidity_ratio"] = out["code"].map(liq)
     return out
 
 

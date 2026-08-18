@@ -44,9 +44,11 @@ def _entries(currency: str, rows: list) -> dict:
     }
 
 
-def test_seed_cik_contains_adrs():
-    assert edgar._SEED_CIK["BABA"] == 1577552
-    assert len(edgar._SEED_CIK) >= 16
+def test_resolve_cik_has_no_seed_fallback(monkeypatch):
+    # 严格模式：SEC 官方映射拉取失败时无可回落，未知代码返回 None（由调用方剔除）
+    monkeypatch.setattr(edgar, "_get_json", lambda url: None)
+    assert edgar.resolve_cik("JD") is None
+    assert edgar.resolve_cik("BABA") is None
 
 
 def test_fetch_us_net_income_cny(monkeypatch):
@@ -104,6 +106,8 @@ def test_ticker_map_resolution(monkeypatch):
     assert edgar.resolve_cik("UNKNOWN") is None
 
 
-def test_ticker_map_failure_falls_back_to_seed(monkeypatch):
+def test_ticker_map_failure_returns_empty(monkeypatch):
+    # 严格模式：SEC 官方映射拉取失败返回空表（无内置种子回退）
     monkeypatch.setattr(edgar, "_get_json", lambda url: None)
-    assert edgar.resolve_cik("JD") == edgar._SEED_CIK["JD"]
+    assert edgar._ticker_cik_map() == {}
+    assert edgar.resolve_cik("JD") is None

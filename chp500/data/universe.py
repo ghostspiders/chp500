@@ -1,18 +1,17 @@
-"""扩展宇宙（演示规模推向 ~500 成分）。
+"""扩展宇宙（演示规模推向 ~500 成分，严格真实模式）。
 
 数据源：
   - A 股公司名/现价/TTM 净利/行业/成交量：真实（Sina + 东财 yjbb）。
-  - 总股本/流通股本/IWF：优先东财 push2 快照（真实，需国内网络或 VPN）；
-    不可达时回落 seeded 合成近似并标记 shares_source=synthetic。
-  - demo_universe.csv 蓝筹沿用人工核定参考股本与跨市场 entity_id（source=reference），
-    其 IWF 为自由流通口径，优先于东财的流通口径。
+  - 总股本/流通股本/IWF：东财 push2 快照（真实，需国内网络或 VPN）；
+    不可达直接报错终止（绝不回落合成/静态近似）。
+  - demo_universe.csv 蓝筹仅用于提供跨市场 entity_id 与上市日（保证去重），
+    股本/市值一律以东财 push2 真实值为准。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from ..config import BASE_DIR, CONFIG
@@ -35,41 +34,51 @@ DATA_DIR = BASE_DIR / "data"
 
 
 def apply_em_shares(df: pd.DataFrame, em: pd.DataFrame | None) -> pd.DataFrame:
-    """用东财快照替换合成股本：总股本=总市值/价、流通股本=流通市值/价、IWF=流通/总。
+    """用东财快照替换股本：总股本=总市值/价、流通股本=流通市值/价、IWF=流通/总。
 
-    em 为 None（东财不可达）或个股缺失时保留合成值；source 标记 em/synthetic。
+    严格模式：em 不可达（None/空）直接报错，绝不回落合成/静态近似。
+    个股未命中标记 shares_source="missing" 并置 NaN，由下游筛选剔除。
     """
-    out = df.copy()
-    out["shares_source"] = "synthetic"
     if em is None or em.empty:
-        return out
+        raise RuntimeError(
+            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，扩展宇宙构建已终止。"
+        )
+    out = df.copy()
+    out["shares_source"] = "missing"
     m = em.set_index("code")
     hit = out["code"].isin(m.index)
-    if not hit.any():
+    idx = out.index[hit]
+    if not len(idx):
         return out
-    em_price = out.loc[hit, "code"].map(m["price"]).astype(float)
-    em_tm = out.loc[hit, "code"].map(m["total_mcap_local"]).astype(float)
-    em_fm = out.loc[hit, "code"].map(m["float_mcap_local"]).astype(float)
+    em_price = out.loc[idx, "code"].map(m["price"]).astype(float)
+    em_tm = out.loc[idx, "code"].map(m["total_mcap_local"]).astype(float)
+    em_fm = out.loc[idx, "code"].map(m["float_mcap_local"]).astype(float)
     valid = em_price > 0
-    idx = out.index[hit][valid]
-    out.loc[idx, "price"] = em_price[valid].values
-    out.loc[idx, "total_shares"] = (em_tm[valid] / em_price[valid]).values
-    out.loc[idx, "float_shares"] = (em_fm[valid] / em_price[valid]).values
-    out.loc[idx, "iwf"] = (em_fm[valid] / em_tm[valid]).values
-    out.loc[idx, "total_mcap"] = em_tm[valid].values  # A 股快照本币即 CNY
-    out.loc[idx, "float_mcap"] = em_fm[valid].values
+    idx = idx[valid]
+    em_price, em_tm, em_fm = em_price[valid], em_tm[valid], em_fm[valid]
+    out.loc[idx, "price"] = em_price
+    out.loc[idx, "total_shares"] = em_tm / em_price
+    out.loc[idx, "float_shares"] = em_fm / em_price
+    out.loc[idx, "iwf"] = em_fm / em_tm
+    out.loc[idx, "total_mcap"] = em_tm  # A 股快照本币即 CNY
+    out.loc[idx, "float_mcap"] = em_fm
     out.loc[idx, "shares_source"] = "em"
+    # 未命中个股：无真实市值/股本，置缺失并标记，下游筛选自然剔除（不回填合成近似）。
+    uncovered = out.index.difference(idx)
+    if len(uncovered):
+        out.loc[uncovered, ["total_shares", "float_shares", "iwf",
+                            "total_mcap", "float_mcap"]] = float("nan")
     return out
 
 
-def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
+def _expanded_a_listing(as_of) -> pd.DataFrame:
     as_of = pd.Timestamp(as_of)
     # 1) 真实 A 股代码/名称
     info = adapters.fetch_a_universe()[["code", "name"]].copy()
     info["code"] = info["code"].astype(str).str.zfill(6)
     info = info.sort_values("code").reset_index(drop=True)
 
-    # 2) 真实现价 / 成交量
+    # 2) 真实现价
     qmap = fetch_a_quotes_sina().set_index("code")
     price = info["code"].map(qmap["price"])
 
@@ -79,15 +88,11 @@ def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
     latest_q = info["code"].map(earn.set_index("code")["latest_q_net_profit"])
     industry = info["code"].map(earn.set_index("code")["industry"])
 
-    # 4) 近似股本 / IWF（seeded 对数正态）。中位 ~10 亿股、sigma=0.6：使合成个股市值多落在
-    #    中大盘区间（约 1500 亿 CNY 中位、99.9 分位 ~1 万亿以内），明显低于真实蓝筹（万亿级以上），
-    #    既保证足够多标的跨过 400 亿市值门槛，又避免合成个股成为扭曲行业的异常巨无霸。
-    #    （股本为演示近似，非真实值；真实蓝筹沿用 demo_universe.csv 的真实近似股本并主导成分前列。）
-    rng = np.random.default_rng(seed)
-    n = len(info)
-    total_shares = rng.lognormal(mean=np.log(1.0e9), sigma=0.6, size=n)
-    iwf = rng.uniform(0.15, 0.95, size=n)
-    listing_offset = rng.integers(400, 6500, size=n)  # 天，绝大多数 > 12 个月
+    em = get_em_spot("A", codes=info["code"].astype(str).tolist())
+    if em is None or em.empty:
+        raise RuntimeError(
+            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，扩展宇宙构建已终止。"
+        )
 
     out = pd.DataFrame({
         "entity_id": "A." + info["code"],
@@ -95,27 +100,21 @@ def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
         "name": info["name"],
         "market": "A",
         "curr": "CNY",
-        "total_shares": total_shares,
-        "iwf": iwf,
         "price": price,
         "ttm_net_profit": ttm,
         "latest_q_net_profit": latest_q,
         "industry": industry,
         "is_st": info["name"].str.contains("ST", case=False, na=False),
         "is_china": True,
-        "listing_date": [as_of - pd.Timedelta(days=int(d)) for d in listing_offset],
+        "listing_date": pd.NaT,
     })
     out["sector"] = out["industry"].map(map_to_sector)
-    out["float_shares"] = out["total_shares"] * out["iwf"]
-    out["total_mcap"] = out["price"] * out["total_shares"]
-    out["float_mcap"] = out["price"] * out["float_shares"]
-    out["liquidity_ratio"] = np.nan  # 候选阶段再算
 
-    # 4b) 东财真实股本/市值（VPN 或国内网络可达时生效；失败回落上方合成值）
-    out = apply_em_shares(out, get_em_spot("A"))
+    # 4) 东财真实股本/市值（严格：不可达已报错；缺失标记 missing，不回落合成）
+    out = apply_em_shares(out, em)
 
-    # 5) 真实大市值蓝筹沿用 curated 参考股本 + 跨市场 entity_id（保证去重）。
-    #    参考表的 IWF 为人工核定自由流通口径（如大行 0.2），优先于东财流通口径。
+    # 5) 真实大市值蓝筹沿用 curated 参考表的 entity_id 与上市日（保证跨市场去重）；
+    #    股本/市值一律以东财 push2 真实值为准（不再用参考表近似）。
     cur = pd.read_csv(DATA_DIR / "demo_universe.csv", dtype={"code": str})
     cur["code"] = cur["code"].str.zfill(6)
     for _, r in cur.iterrows():
@@ -123,14 +122,8 @@ def _expanded_a_listing(as_of, seed: int = 42) -> pd.DataFrame:
         mask = out["code"] == c
         if not mask.any():
             continue
-        out.loc[mask, "total_shares"] = float(r["total_shares"])
-        out.loc[mask, "iwf"] = float(r["iwf"])
         out.loc[mask, "entity_id"] = r["entity_id"]
         out.loc[mask, "listing_date"] = pd.Timestamp(r["listing_date"])
-        out.loc[mask, "float_shares"] = float(r["total_shares"]) * float(r["iwf"])
-        out.loc[mask, "total_mcap"] = out.loc[mask, "price"] * float(r["total_shares"])
-        out.loc[mask, "float_mcap"] = out.loc[mask, "price"] * out.loc[mask, "float_shares"]
-        out.loc[mask, "shares_source"] = "reference"
     return out
 
 
@@ -155,19 +148,21 @@ def build_expanded_cross_market_snapshot(as_of, markets=None) -> pd.DataFrame:
     listing = pd.concat(parts, ignore_index=True)
     entities = merge_entities(listing)
 
-    # 候选筛选（除流动性外）：用于决定需要算流动性的子集
     from ..filter import screens
-    base = screens.add_screen_diagnostics(entities, as_of)
-    base_flags = ["pass_st", "pass_listing", "pass_mcap", "pass_iwf", "pass_profit", "pass_china"]
-    cand_idx = base.index[base[base_flags].all(axis=1)]
-    cand = entities.loc[cand_idx]
+    # 粗筛（市值/股本IWF/盈利/ST/中资）：上市日与流动性均依赖 Sina 日线，
+    # 故先据此筛出候选，再抓日线回填二者，避免对数千只 A 股做无谓抓取。
+    # 注意：扩展宇宙 listing_date 初始为 NaT（仅蓝筹沿用 curated 参考表），
+    # 真实上市日由下方 Sina 日线首日推导。
+    coarse = screens.add_screen_diagnostics(entities, as_of)
+    coarse_flags = ["pass_st", "pass_mcap", "pass_iwf", "pass_profit", "pass_china"]
+    coarse_cand = entities.loc[coarse.index[coarse[coarse_flags].all(axis=1)]]
 
-    # 流动性只在「有机会进入前 ~500 的候选」上计算，避免对数千只 A 股做 Sina 抓取。
+    # 流动性/上市日只在「有机会进入前 ~500 的候选」上计算，避免对数千只 A 股做 Sina 抓取。
     # 取按 float_mcap 降序的前 K 名（K 远大于 target_count，覆盖流动性筛选后的余量）。
     k = int(CONFIG.get("target_count", 500)) + 1100  # 1600：流动性阈值会淘汰约一半，需足够余量
-    topk = cand.sort_values("float_mcap", ascending=False).head(k)
+    topk = coarse_cand.sort_values("float_mcap", ascending=False).head(k)
 
-    # A 候选流动性（真实 Sina daily）
+    # A 候选：抓 Sina 日线，既算流动性也算真实上市日（日线首日=上市日）
     a_topk = topk[topk["market"] == "A"]
     if len(a_topk):
         codes = a_topk["code"].tolist()
@@ -180,8 +175,14 @@ def build_expanded_cross_market_snapshot(as_of, markets=None) -> pd.DataFrame:
         )
         liq = compute_liquidity(volumes, fs)
         entities.loc[a_topk.index, "liquidity_ratio"] = a_topk["code"].map(liq)
+        # 真实上市日：Sina 日线首日（_cached_a_daily 已缓存全量历史）
+        for code in codes:
+            df = adapters._cached_a_daily(code)
+            if df is not None and not df.empty:
+                idx = a_topk.index[a_topk["code"] == code]
+                entities.loc[idx, "listing_date"] = pd.Timestamp(df["date"].min())
 
-    # HK/US 候选流动性已在 build_hk_us_listing_snapshot 中算好，merge 已带入
+    # HK/US 候选的上市日与流动性已在 build_hk_us_listing_snapshot 中算好，merge 已带入
     return entities
 
 

@@ -1,8 +1,12 @@
-"""真实股本/财务接入（universe / adapters 新增纯函数）单元测试。"""
+"""真实股本/财务接入（universe / adapters 严格真实模式）单元测试。
+
+严格模式：东财 push2 / 真实财务不可达时直接报错，绝不回落 reference/synthetic/static。
+"""
 
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from chp500.data import adapters
 from chp500.data.universe import apply_em_shares
@@ -12,7 +16,7 @@ def _a_listing() -> pd.DataFrame:
     return pd.DataFrame({
         "code": ["600000", "603444"],
         "price": [10.0, 389.8],
-        "total_shares": [1e10, 3.568e9],   # 合成值（吉比特被放大 50 倍的场景）
+        "total_shares": [1e10, 3.568e9],
         "float_shares": [5e9, 2.38e9],
         "iwf": [0.5, 0.667],
         "total_mcap": [1e11, 1.39e12],
@@ -28,23 +32,23 @@ def _em_a() -> pd.DataFrame:
     ])
 
 
-def test_apply_em_shares_replaces_synthetic():
+def test_apply_em_shares_em_or_missing():
+    # 命中东财 push2 者标记 em；未命中标记 missing 且市值/股本置 NaN（下游剔除，不回填近似）
     out = apply_em_shares(_a_listing(), _em_a())
     g = out[out["code"] == "603444"].iloc[0]
     assert g["shares_source"] == "em"
     assert g["total_shares"] == 2.806e10 / 389.8
     assert g["iwf"] == 1.0
     assert g["total_mcap"] == 2.806e10
-    # 未命中的个股保留合成值并标记
     other = out[out["code"] == "600000"].iloc[0]
-    assert other["shares_source"] == "synthetic"
-    assert other["total_shares"] == 1e10
+    assert other["shares_source"] == "missing"
+    assert pd.isna(other["total_shares"])
+    assert pd.isna(other["total_mcap"])
 
 
-def test_apply_em_shares_none_degrades_to_synthetic():
-    out = apply_em_shares(_a_listing(), None)
-    assert (out["shares_source"] == "synthetic").all()
-    assert out["total_shares"].tolist() == [1e10, 3.568e9]
+def test_apply_em_shares_none_raises():
+    with pytest.raises(RuntimeError):
+        apply_em_shares(_a_listing(), None)
 
 
 def _hk_listing() -> pd.DataFrame:
@@ -76,13 +80,40 @@ def test_apply_em_shares_local_hk(monkeypatch):
     assert t["total_shares"] == 4.0636e12 / 446.4
     assert t["total_mcap"] == 4.0636e12 * 0.91  # CNY
     m = out[out["code"] == "030760"].iloc[0]
-    assert m["shares_source"] == "static"
-    assert m["total_shares"] == 1.2e9
+    assert m["shares_source"] == "missing"
+    assert pd.isna(m["total_shares"])
 
 
-def test_apply_em_shares_local_none(monkeypatch):
-    out = adapters.apply_em_shares_local(_hk_listing(), None, fxr=0.91)
-    assert (out["shares_source"] == "static").all()
+def test_apply_em_shares_local_none_raises(monkeypatch):
+    with pytest.raises(RuntimeError):
+        adapters.apply_em_shares_local(_hk_listing(), None, fxr=0.91)
+
+
+def _a_reference_listing() -> pd.DataFrame:
+    # 精选(curated) A 股基线（不再作为回落近似，仅用于验证命中/未命中分流）
+    return pd.DataFrame({
+        "code": ["600000", "603444"],
+        "price": [10.0, 389.8],
+        "total_shares": [1e10, 3.568e9],
+        "float_shares": [5e9, 2.38e9],
+        "iwf": [0.5, 0.667],
+        "total_mcap_local": [1e11, 1.39e12],
+        "float_mcap_local": [5e10, 9.28e11],
+        "total_mcap": [1e11, 1.39e12],
+        "float_mcap": [5e10, 9.28e11],
+    })
+
+
+def test_apply_em_shares_local_em_or_missing(monkeypatch):
+    # 命中东财 push2 者标记 em，未命中标记 missing（不再回落人工核定参考表）
+    out = adapters.apply_em_shares_local(_a_reference_listing(), _em_a(), fxr=1.0)
+    hit = out[out["code"] == "603444"].iloc[0]
+    assert hit["shares_source"] == "em"
+    assert hit["total_shares"] == 2.806e10 / 389.8
+    assert hit["iwf"] == 1.0
+    miss = out[out["code"] == "600000"].iloc[0]
+    assert miss["shares_source"] == "missing"
+    assert pd.isna(miss["total_shares"])
 
 
 def _us_listing() -> pd.DataFrame:
@@ -105,8 +136,9 @@ def test_apply_real_earnings_us_edgar(monkeypatch):
     out = adapters.apply_real_earnings(_us_listing(), "US", usd_cny=7.1)
     b = out[out["code"] == "BABA"].iloc[0]
     assert b["profit_source"] == "edgar" and b["ttm_net_profit"] == 1.2e11
+    # NIO 无真实财务：标记 missing，净利润置 NaN（不回落 static）
     n = out[out["code"] == "NIO"].iloc[0]
-    assert n["profit_source"] == "static" and n["ttm_net_profit"] == -1.0e10
+    assert n["profit_source"] == "missing" and pd.isna(n["ttm_net_profit"])
 
 
 def test_apply_real_earnings_hk_em(monkeypatch):
@@ -125,14 +157,15 @@ def test_apply_real_earnings_hk_em(monkeypatch):
     t = out[out["code"] == "00700"].iloc[0]
     assert t["profit_source"] == "em"
     assert t["ttm_net_profit"] == 1141.15e8 - 1088.0e8 + 2248.42e8
-    assert t["latest_q"] if "latest_q" in out else True
-    assert out[out["code"] == "09988"].iloc[0]["profit_source"] == "static"
+    # 09988 无真实财报：标记 missing，不回落 static
+    assert out[out["code"] == "09988"].iloc[0]["profit_source"] == "missing"
 
 
-def test_apply_real_earnings_exception_degrades(monkeypatch):
+def test_apply_real_earnings_exception_raises(monkeypatch):
     def _boom(ticker, usd_cny=7.1):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(adapters.edgar, "fetch_us_net_income", _boom)
-    out = adapters.apply_real_earnings(_us_listing(), "US", usd_cny=7.1)
-    assert (out["profit_source"] == "static").all()
+    # 整批均无真实财务（源整体不可用）→ 报错终止，不静默回落 static
+    with pytest.raises(RuntimeError):
+        adapters.apply_real_earnings(_us_listing(), "US", usd_cny=7.1)

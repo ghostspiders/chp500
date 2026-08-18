@@ -41,7 +41,7 @@ function render(d) {
     ["成分数", d.n_constituents],
     ["候选池", d.n_universe],
     ["Top1", pct(c.top1)],
-    ["Top10", pct(c.top10)],
+    ["Top30", pct(c.top30)],
     ["HHI", (c.hhi || 0).toFixed(4)],
     ["有效成分数", Math.round(c.effective_n || 0)],
   ].map(([k, v]) => `<div class="kpi"><div class="kpi-v">${v}</div><div class="kpi-k">${k}</div></div>`).join("");

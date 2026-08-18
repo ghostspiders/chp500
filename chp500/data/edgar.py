@@ -1,6 +1,6 @@
 """SEC EDGAR 美股中概净利数据（权威、免认证）。
 
-- CIK 解析：运行时拉取 SEC 官方 company_tickers.json，失败回落内置种子表。
+- CIK 解析：运行时拉取 SEC 官方 company_tickers.json；失败则无可回落（返回 None，交由调用方剔除该成分）。
 - 净利：XBRL companyconcept（us-gaap:NetIncomeLoss，缺失时试 ifrs-full）。
 - 口径：披露币种优先 CNY（多数中概 ADR 双币披露），否则 USD × 汇率折算。
 - 财年错位（如阿里 3 月财年）由 ttm_periods 的期间匹配天然处理。
@@ -20,14 +20,6 @@ from .ttm_periods import compute_ttm_from_periods
 
 _UA = "chp500-index-research/0.1 (research project; contact: dev@chp500.local)"
 _BASE = "https://data.sec.gov/api/xbrl/companyconcept"
-
-# 种子表（运行时以 SEC 官方映射校准/覆盖；仅网络全断时兜底）
-_SEED_CIK = {
-    "BABA": 1577552, "JD": 1549802, "NTES": 1110646, "PDD": 1737806,
-    "BIDU": 1329099, "NIO": 1736541, "XPEV": 1810997, "LI": 1791706,
-    "BILI": 1493259, "TME": 1744905, "VIPS": 1571927, "EDU": 1369563,
-    "FUTU": 1752786, "TIGR": 1772157, "IQ": 1677250, "YMM": 1782170,
-}
 
 _CACHE = Cache(CONFIG["cache_dir"], ttl_days=CONFIG.get("cache_ttl_days", 7))
 
@@ -51,7 +43,7 @@ def _get_json(url: str) -> dict | None:
 def _ticker_cik_map() -> dict[str, int]:
     data = _CACHE.get_or_fetch("edgar_ticker_map", lambda: _fetch_ticker_map())
     if data is None:
-        return dict(_SEED_CIK)
+        return {}
     return {str(k).upper(): int(v) for k, v in data.items()}
 
 
@@ -73,8 +65,8 @@ def resolve_cik(ticker: str) -> int | None:
     try:
         m = _ticker_cik_map()
     except Exception:  # noqa: BLE001
-        return _SEED_CIK.get(ticker)
-    return m.get(ticker, _SEED_CIK.get(ticker))
+        return None
+    return m.get(ticker)
 
 
 def _extract_periods(concept: dict) -> tuple[list, str] | None:
@@ -101,7 +93,7 @@ def _fetch_concept(cik: int, taxonomy: str) -> dict | None:
 def fetch_us_net_income(ticker: str, usd_cny: float = 7.10) -> dict | None:
     """返回 {ttm, latest_q, granularity, latest_end, currency}（均为 CNY）。
 
-    拉取/解析任一环节失败返回 None，调用方回落静态参考值并标记。
+    拉取/解析任一环节失败返回 None，由调用方标记 missing 并剔除该成分。
     """
     cik = resolve_cik(ticker)
     if not cik:

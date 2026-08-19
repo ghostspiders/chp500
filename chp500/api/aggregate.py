@@ -120,8 +120,11 @@ def load_summary(universe: str) -> dict:
     if "profit_source" in c.columns:
         src["profit"] = {str(k): int(v) for k, v in c["profit_source"].value_counts().items()}
     n_all = max(len(c), 1)
-    real_shares = src["shares"].get("tencent", 0) / n_all
-    real_profit = (src["profit"].get("tencent", 0) + src["profit"].get("edgar", 0)) / n_all
+    # 真实市值/股本来源：腾讯快照（落盘标记曾用 "em"，新版用 "tencent"），两者均视为真实。
+    real_shares_n = src["shares"].get("tencent", 0) + src["shares"].get("em", 0)
+    real_profit_n = src["profit"].get("tencent", 0) + src["profit"].get("em", 0) + src["profit"].get("edgar", 0)
+    real_shares = real_shares_n / n_all
+    real_profit = real_profit_n / n_all
 
     return {
         "universe": universe,

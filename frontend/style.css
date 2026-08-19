@@ -147,6 +147,25 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mkt-US { color: #c99bfd; background: rgba(192, 132, 252, 0.14); }
 .muted { color: var(--muted); font-size: 12px; }
 
+/* ---- 导出图片画廊 ---- */
+#dl-panel { scroll-margin-top: 80px; }
+#dl-panel h3 { justify-content: space-between; }
+.gallery {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px; margin-top: 6px;
+}
+.dl-card {
+  background: var(--panel-solid); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.dl-card .dl-name { font-size: 13px; color: #cbd5e1; font-weight: 600; }
+.dl-card img {
+  width: 100%; border-radius: 8px; background: #0f172a; display: block;
+  border: 1px solid var(--border);
+}
+.dl-card .dl-save { text-align: center; text-decoration: none; }
+.dl-err { color: var(--err); font-size: 12px; }
+
 footer { padding: 18px 24px 30px; color: var(--muted); font-size: 12px; text-align: center; }
 code { background: #1e293b; padding: 2px 6px; border-radius: 5px; font-size: 11.5px; }
 

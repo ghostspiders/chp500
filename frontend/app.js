@@ -33,6 +33,7 @@ const KPI_ICONS = {
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
+let lastSummary = null; // 供下载导出复用最新一次加载的快照
 
 function setStatus(msg, kind) {
   statusEl.textContent = msg || "";
@@ -69,6 +70,7 @@ async function loadSummary() {
 }
 
 function render(d) {
+  lastSummary = d; // 供「下载图片」导出复用
   // ---- KPI ----
   const c = d.concentration || {};
   const kpiDefs = [
@@ -156,6 +158,210 @@ function render(d) {
   $("tbl-count").textContent = "（" + d.constituents.length + " 只）";
 }
 
+/* ============================================================
+   下载图片（纯前端高分辨率导出）
+   - 图表：Plotly.toImage 以 1080px 设计宽 + scale=3 导出，社交平台会
+     下采样到 ~1080px，文本依然锐利（Retina 原理）。
+   - 明细表：直接绘制到高 DPI <canvas>（canvas.width = 设计宽*scale,
+     ctx.scale(scale,scale)），避免 html2canvas 的 CSS 缩放模糊；字体按
+     1080px 宽度设计（~20-32px），并交由浏览器使用系统中文字体渲染。
+   ============================================================ */
+const EXPORT = {
+  paper_bgcolor: "#0f172a",
+  plot_bgcolor: "#0f172a",
+  font: { family: "'PingFang SC','Microsoft YaHei','Inter',sans-serif", size: 16, color: "#e6edf7" },
+  margin: { t: 64, l: 70, r: 40, b: 50 },
+};
+// 绘制导出图时复用 axis 工厂（避免 Plotly 原地改写污染）
+const exAxis = () => ({
+  gridcolor: "rgba(148,163,184,0.12)", zeroline: false,
+  linecolor: "rgba(148,163,184,0.25)", tickfont: { size: 15, color: "#cbd5e1" },
+});
+
+function figIndex(d) {
+  const i = d.index;
+  return {
+    data: [
+      { x: i.dates, y: i.price_index, name: "价格指数", type: "scatter", mode: "lines",
+        line: { color: "#60a5fa", width: 3 }, fill: "tozeroy", fillcolor: "rgba(96,165,250,0.08)",
+        hovertemplate: "%{x|%Y-%m-%d}<br>%{y:.2f}<extra>价格指数</extra>" },
+      { x: i.dates, y: i.total_return, name: "全收益指数", type: "scatter", mode: "lines",
+        line: { color: "#34d399", width: 3, dash: "dot" },
+        hovertemplate: "%{x|%Y-%m-%d}<br>%{y:.2f}<extra>全收益指数</extra>" },
+    ],
+    layout: { ...EXPORT, width: 1080, height: 620,
+      title: { text: "CHP 500 指数走势（基点 1000）", font: { size: 26, color: "#e6edf7" }, x: 0.01 },
+      xaxis: exAxis(), yaxis: { ...exAxis(), tickformat: ",.0f" },
+      legend: { orientation: "h", x: 0, y: 1.07, font: { size: 15, color: "#cbd5e1" } },
+      margin: { t: 92, l: 70, r: 40, b: 50 } },
+  };
+}
+
+function figSector(d) {
+  return {
+    data: [{
+      labels: d.sectors.map((s) => s.sector), values: d.sectors.map((s) => s.weight),
+      type: "pie", hole: 0.52, textinfo: "percent", insidetextorientation: "horizontal",
+      textfont: { size: 16, color: "#0b1120" },
+      hovertemplate: "%{label}：%{percent}<extra></extra>",
+      marker: { colors: PALETTE.slice(0, Math.max(d.sectors.length, 1)),
+                line: { color: "#0f172a", width: 2 } },
+    }],
+    layout: { ...EXPORT, width: 1080, height: 1080,
+      title: { text: "CHP 500 行业权重分布", font: { size: 26, color: "#e6edf7" }, x: 0.01 },
+      showlegend: true,
+      legend: { orientation: "v", x: 1.03, y: 0.5, font: { size: 16, color: "#cbd5e1" }, bgcolor: "rgba(0,0,0,0)" },
+      margin: { t: 72, l: 40, r: 220, b: 40 } },
+  };
+}
+
+function figMarket(d) {
+  return {
+    data: [{
+      x: d.markets.map((m) => m.market), y: d.markets.map((m) => m.weight), type: "bar",
+      text: d.markets.map((m) => pct(m.weight)), textposition: "outside", textfont: { size: 18, color: "#cbd5e1" },
+      hovertemplate: "%{x}：%{y:.1%}<extra></extra>",
+      marker: { color: d.markets.map((m) => MKT_COLOR[m.market] || "#60a5fa") },
+    }],
+    layout: { ...EXPORT, width: 1080, height: 620,
+      title: { text: "CHP 500 市场权重分布", font: { size: 26, color: "#e6edf7" }, x: 0.01 },
+      xaxis: exAxis(), yaxis: { ...exAxis(), rangemode: "tozero", tickformat: ".0%" },
+      bargap: 0.4, margin: { t: 92, l: 70, r: 40, b: 50 } },
+  };
+}
+
+function figTop(d) {
+  const top = d.top.slice().reverse();
+  const n = Math.max(top.length - 1, 1);
+  const barColors = top.map((_, i) => `rgba(96,165,250,${(0.95 - (i / n) * 0.55).toFixed(3)})`);
+  return {
+    data: [{
+      y: top.map((t) => t.name), x: top.map((t) => t.weight), type: "bar", orientation: "h",
+      text: top.map((t) => pct(t.weight)), textposition: "outside", textfont: { size: 16, color: "#cbd5e1" },
+      hovertemplate: "%{y}：%{x:.2%}<extra></extra>",
+      marker: { color: barColors },
+    }],
+    layout: { ...EXPORT, width: 1080, height: 1180,
+      title: { text: "CHP 500 个股权重 TOP 30", font: { size: 26, color: "#e6edf7" }, x: 0.01 },
+      xaxis: { ...exAxis(), rangemode: "tozero", tickformat: ".0%" },
+      yaxis: { ...exAxis(), tickfont: { size: 16, color: "#e6edf7" }, automargin: true },
+      margin: { l: 150, r: 70, t: 92, b: 50 } },
+  };
+}
+
+// Plotly 图表 -> 高分辨率 PNG dataURL
+function plotlyExport(fig, scale = 3) {
+  return Plotly.toImage(fig, { format: "png", width: fig.layout.width, height: fig.layout.height, scale });
+}
+
+// 明细表单页 -> 高 DPI canvas PNG dataURL
+function drawDetailPage(rows, pageIdx, pages, total, perPage, scale = 2) {
+  const W = 1080, pad = 40, titleH = 100, headH = 60, rowH = 46;
+  const H = titleH + headH + rows.length * rowH + pad;
+  const cv = document.createElement("canvas");
+  cv.width = W * scale; cv.height = H * scale;
+  const ctx = cv.getContext("2d");
+  ctx.scale(scale, scale);
+
+  // 背景 + 顶部渐变条
+  ctx.fillStyle = "#0f172a"; ctx.fillRect(0, 0, W, H);
+  const g = ctx.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, "#3b82f6"); g.addColorStop(1, "#8b5cf6");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 6);
+
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#e6edf7";
+  ctx.font = '700 32px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText("CHP 500 成分明细", pad, titleH / 2 - 8);
+  ctx.fillStyle = "#8ba0bd";
+  ctx.font = '400 18px "PingFang SC","Microsoft YaHei",sans-serif';
+  const asof = lastSummary && lastSummary.as_of ? " · as_of " + lastSummary.as_of : "";
+  ctx.fillText(`第 ${pageIdx + 1} / ${pages} 页 · 共 ${total} 只成分${asof}`, pad, titleH / 2 + 24);
+
+  const cols = [
+    { k: "#", x: pad, w: 64, align: "left" },
+    { k: "代码", x: pad + 64, w: 120, align: "left" },
+    { k: "名称", x: pad + 184, w: 240, align: "left" },
+    { k: "市场", x: pad + 424, w: 90, align: "left" },
+    { k: "行业", x: pad + 514, w: 242, align: "left" },
+    { k: "权重", x: W - pad - 130, w: 130, align: "right" },
+  ];
+  const mktColor = { A: "#7fb2ff", HK: "#4ade80", US: "#c99bfd" };
+
+  // 表头
+  let y = titleH + headH / 2;
+  ctx.fillStyle = "#1e293b"; ctx.fillRect(pad - 8, titleH, W - 2 * pad + 16, headH);
+  ctx.fillStyle = "#bcd3ff";
+  ctx.font = '600 20px "PingFang SC","Microsoft YaHei",sans-serif';
+  for (const c of cols) { ctx.textAlign = c.align; ctx.fillText(c.k, c.align === "right" ? c.x + c.w : c.x, y); }
+
+  // 数据行
+  rows.forEach((r, i) => {
+    const ry = titleH + headH + i * rowH + rowH / 2;
+    if (i % 2 === 0) { ctx.fillStyle = "rgba(148,163,184,0.05)"; ctx.fillRect(pad - 8, titleH + headH + i * rowH, W - 2 * pad + 16, rowH); }
+    ctx.font = '400 20px "PingFang SC","Microsoft YaHei",sans-serif';
+    const gi = i + pageIdx * perPage;
+    const vals = [String(gi + 1), r.code, r.name, r.market, (r.sector || "—"), pct(r.weight)];
+    cols.forEach((c, ci) => {
+      ctx.textAlign = c.align;
+      if (ci === 3) ctx.fillStyle = mktColor[r.market] || "#cbd5e1";
+      else if (ci === 5) ctx.fillStyle = "#7fb2ff";
+      else ctx.fillStyle = "#cbd5e1";
+      ctx.fillText(vals[ci], c.align === "right" ? c.x + c.w : c.x, ry);
+    });
+  });
+  ctx.textAlign = "left";
+  return cv.toDataURL("image/png");
+}
+
+function showGallery(imgs) {
+  const panel = $("dl-panel");
+  panel.hidden = false;
+  $("dl-count").textContent = `（共 ${imgs.length} 张 · 可逐张「保存」或「全部下载」）`;
+  panel.querySelector(".gallery").innerHTML = imgs.map((im) => `
+    <div class="dl-card">
+      <div class="dl-name">${im.name}</div>
+      ${im.url
+        ? `<img src="${im.url}" alt="${im.name}" loading="lazy">`
+        : `<div class="dl-err">生成失败：${im.err || "未知错误"}</div>`}
+      ${im.url ? `<a class="btn primary dl-save" download="${im.name}" href="${im.url}">保存这张</a>` : ""}
+    </div>`).join("");
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function downloadImages() {
+  if (!lastSummary) { setStatus("请先加载数据再下载", "err"); return; }
+  setStatus("生成图片中（高分辨率导出）…", "info");
+  const imgs = [];
+
+  // 1) 四张图表（Plotly 异步导出）
+  const charts = [
+    ["CHP500_指数走势.png", figIndex],
+    ["CHP500_行业权重分布.png", figSector],
+    ["CHP500_市场权重分布.png", figMarket],
+    ["CHP500_个股权重TOP30.png", figTop],
+  ];
+  if (!lastSummary.index) charts.shift(); // 无指数序列则跳过
+  for (const [name, fn] of charts) {
+    try { imgs.push({ name, url: await plotlyExport(fn(lastSummary), 3) }); }
+    catch (e) { imgs.push({ name, err: e && e.message }); }
+  }
+
+  // 2) 明细表：分成 5 页绘制到 canvas（高 DPI）
+  const cons = lastSummary.constituents || [];
+  const pages = 5;
+  const perPage = Math.ceil(cons.length / pages);
+  for (let p = 0; p < pages; p++) {
+    const rows = cons.slice(p * perPage, (p + 1) * perPage);
+    if (!rows.length) continue;
+    imgs.push({ name: `CHP500_成分明细_第${p + 1}页.png`, url: drawDetailPage(rows, p, pages, cons.length, perPage, 2) });
+  }
+
+  showGallery(imgs);
+  setStatus(`已生成 ${imgs.filter((x) => x.url).length} 张图片`, "ok");
+}
+
 async function doBuild() {
   const universe = $("universe").value;
   setStatus("构建中（后台任务，请稍候）…", "info");
@@ -187,4 +393,9 @@ async function pollBuild(universe) {
 $("reload").onclick = loadSummary;
 $("build").onclick = doBuild;
 $("universe").onchange = loadSummary;
+$("dl").onclick = downloadImages;
+$("dl-all").onclick = () => {
+  const links = document.querySelectorAll("#dl-panel .dl-save");
+  links.forEach((a, i) => setTimeout(() => a.click(), i * 350)); // 逐张触发，避免浏览器拦截批量下载
+};
 loadSummary();

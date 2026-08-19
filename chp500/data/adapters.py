@@ -30,6 +30,7 @@ import requests
 from ..config import BASE_DIR, CONFIG
 from . import edgar, fx
 from .cache import Cache
+from .sources import source_url
 from .spot import fetch_spot
 from .xueqiu import fetch_a_industry
 from .merge import merge_entities
@@ -85,10 +86,11 @@ def _fetch_a_quotes_tencent() -> pd.DataFrame:
     info = ak.stock_info_a_code_name()
     codes = info["code"].astype(str).tolist()
     tq = [("sh" + c) if c[:1] == "6" else ("sz" + c) for c in codes]
+    qt_base = source_url("tencent_spot", "https://qt.gtimg.cn/q=")
     rows = []
     for i in range(0, len(tq), 150):
         try:
-            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(tq[i:i + 150]), timeout=25)
+            r = requests.get(qt_base + ",".join(tq[i:i + 150]), timeout=25)
             txt = r.content.decode("gbk", "ignore")
         except Exception:  # noqa: BLE001
             continue

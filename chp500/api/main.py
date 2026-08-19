@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.build_index import run as build_run  # noqa: E402
 from . import aggregate  # noqa: E402
+from ..data.sources import data_sources, validate as validate_sources  # noqa: E402
 
 FRONTEND_DIR = ROOT / "frontend"
 
@@ -107,6 +108,12 @@ def health():
 @app.get("/api/universes")
 def universes():
     return {"universes": aggregate.list_universes()}
+
+
+@app.get("/api/sources")
+def source_registry():
+    """数据源注册表（config.yaml: data_sources）：每个源的接口明细与不可达策略。"""
+    return {"sources": data_sources(), "problems": validate_sources()}
 
 
 @app.get("/api/summary")

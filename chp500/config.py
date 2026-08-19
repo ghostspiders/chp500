@@ -33,7 +33,7 @@ _DEFAULTS = {
     "committee_discretion": True,
     "include_bse": False,
     "markets": ["A", "HK", "US"],
-    "data_source": "akshare",
+    "data_sources": {},  # 数据源注册表（config.yaml: data_sources，见 chp500/data/sources.py）
     "cache_dir": ".cache",
     "cache_ttl_days": 7,
 }

@@ -48,7 +48,97 @@ markets:                     # 覆盖市场
   - HK
   - US
 
-# ---- 数据源 ----
-data_source: akshare         # 主数据源：akshare（Sina 行情 / 雪球行业 / 中行汇率）+ 腾讯行情快照（市值/股本/PE推导净利）+ SEC EDGAR（美股净利）
-cache_dir: .cache            # 数据缓存目录（parquet）
-cache_ttl_days: 7            # 缓存有效期（天）：调小更即时但增加 AkShare 抓取量；留空/0 表示永不过期
+# ---- 数据源（单一事实来源：每个源一个条目，罗列接口/调用 API 与策略） ----
+# transport: http=requests 直连（base_url 可改址覆盖）；akshare=经 akshare 调用（接口明细仅供排查）；
+#            local=本地文件
+# 读取方：chp500/data/sources.py（加载/校验/URL 读取），REST 暴露于 /api/sources
+data_sources:
+  tencent_spot:
+    name: 腾讯行情快照
+    transport: http
+    module: chp500/data/spot.py
+    base_url: https://qt.gtimg.cn/q=
+    endpoints:
+      - api: "GET {base_url}{symbols}"
+        desc: 批量快照，<=150 只/批，前缀 sh/sz(A)、hk(5位补零)、us(大写)；GBK 编码
+        fields: 现价=f3 / 总市值=f45(亿本币) / 流通市值=f44(A,US；HK 无数据以 f45 近似) / PE(TTM)=f39(亏损为负)
+    provides: [现价, 总市值, 流通市值, 总股本(市值/价反推), 流通股本, IWF(流通/总), PE(TTM), TTM净利(=总市值/PE 推导)]
+    markets: [A, HK, US]
+    on_failure: 报错终止（严格真实模式）
+  xueqiu_info:
+    name: 雪球个股信息
+    transport: http
+    module: chp500/data/xueqiu.py
+    base_url: https://stock.xueqiu.com
+    urls:
+      bootstrap: https://xueqiu.com/about          # cookie/token 引导（浏览器 UA）
+      industry: /v5/stock/f10/cn/company.json      # ?symbol=SH/SZ{code}
+    endpoints:
+      - api: "GET {urls.bootstrap}"
+        desc: 引导会话 cookie（xq_a_token），后续接口必需
+      - api: "GET {base_url}{urls.industry}?symbol=SH600519"
+        desc: A 股行业，取 company.affiliate_industry.ind_name（如"白酒"）
+    provides: [A股行业]
+    markets: [A]
+    on_failure: 选样后缺失归"其他"板块（展示字段，不影响选样权重）
+  sec_edgar:
+    name: SEC EDGAR（美股财报，免认证权威源）
+    transport: http
+    module: chp500/data/edgar.py
+    base_url: https://data.sec.gov/api/xbrl/companyconcept
+    urls:
+      ticker_map: https://www.sec.gov/files/company_tickers.json
+    headers: {User-Agent: "chp500-index-research/0.1 (contact: dev@chp500.local)"}  # SEC 要求自报身份；限速 10 req/s
+    endpoints:
+      - api: "GET {urls.ticker_map}"
+        desc: ticker -> CIK 映射（运行时拉取，无内置种子）
+      - api: "GET {base_url}/CIK{cik:010d}/us-gaap/NetIncomeLoss.json"
+        desc: 归母净利（XBRL，CNY 单位优先；404 时改试 ifrs-full 分类）
+    provides: [美股TTM净利, 美股最新单季净利]
+    markets: [US]
+    on_failure: 个股标记 missing 由筛选剔除；整批不可用报错终止
+  sina_market:
+    name: 新浪行情（akshare）
+    transport: akshare
+    module: chp500/data/adapters.py
+    endpoints:
+      - api: "ak.stock_info_a_code_name()"
+        desc: A 股全量代码/名称（宇宙构建入口）
+      - api: "ak.stock_zh_a_spot()"
+        desc: A 股批量现价/成交量（底层 hq.sinajs.cn；行数<1000 判残缺触发腾讯回退）
+      - api: "ak.stock_zh_a_daily(symbol='sh600519', adjust='qfq')"
+        desc: A 股日线（前复权）：历史价格/成交量/流动性/上市日推导（日线首日）
+      - api: "ak.stock_hk_daily(symbol='00700', adjust='qfq')"
+        desc: 港股日线：价格/成交量/上市日推导
+      - api: "ak.stock_us_daily(symbol='BABA', adjust='qfq')"
+        desc: 美股日线：价格/成交量/上市日推导
+    provides: [代码/名称, 现价, 日线行情, 成交量, 流动性, 上市日(推导)]
+    markets: [A, HK, US]
+    on_failure: 单只 3 次重试后跳过；A 股批量现价失败回退腾讯
+  boc_fx:
+    name: 中行汇率（akshare）
+    transport: akshare
+    module: chp500/data/fx.py
+    endpoints:
+      - api: "ak.currency_boc_sina(symbol='美元'|'港币', start_date, end_date)"
+        desc: 央行中间价/100 = CNY per 1 外币（多币种折算基准）
+    provides: [USD/HKD->CNY 汇率]
+    markets: [HK, US]
+    on_failure: 静态近似回退（USD 7.10 / HKD 0.91）
+  local_reference:
+    name: 本地参考表
+    transport: local
+    module: data/demo_*.csv
+    endpoints:
+      - api: data/demo_universe.csv
+        desc: A 股蓝筹跨市场 entity_id 与上市日（去重用，不作股本来源）
+      - api: data/demo_hk.csv
+        desc: 港股参考集 + 人工核定行业（免费接口无港美行业字段）
+      - api: data/demo_us.csv
+        desc: 美股参考集 + 人工核定行业
+    provides: [entity_id, A蓝筹上市日, HK/US行业(人工核定)]
+    markets: [A, HK, US]
+    on_failure: 无（本地文件）
+
+cache_dir: .cache            # 数据缓存目录（parquet/JSON）
+cache_ttl_days: 7            # 缓存有效期（天）：调小更即时但增加抓取量；留空/0 表示永不过期

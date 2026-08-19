@@ -13,6 +13,14 @@ import requests
 
 from ..config import CONFIG
 from .cache import Cache
+from .sources import source_url, source_urls
+
+# 接口地址（config.yaml: data_sources.xueqiu_info 的 base_url/urls 可改址覆盖）
+_BASE = source_url("xueqiu_info", "https://stock.xueqiu.com").rstrip("/")
+_URLS = source_urls("xueqiu_info", {
+    "bootstrap": "https://xueqiu.com/about",
+    "industry": "/v5/stock/f10/cn/company.json",
+})
 
 _CACHE = Cache(CONFIG["cache_dir"], ttl_days=CONFIG.get("cache_ttl_days", 7))
 
@@ -27,7 +35,7 @@ def _get_session() -> requests.Session:
         s = requests.Session()
         s.headers.update({"User-Agent": _UA})
         try:
-            s.get("https://xueqiu.com/about", timeout=15)  # 引导 cookie token
+            s.get(_URLS["bootstrap"], timeout=15)  # 引导 cookie token
         except Exception:  # noqa: BLE001
             pass
         _session = s
@@ -42,7 +50,7 @@ def _a_symbol(code: str) -> str:
 def _fetch_one(code: str) -> str | None:
     try:
         r = _get_session().get(
-            "https://stock.xueqiu.com/v5/stock/f10/cn/company.json",
+            _BASE + "/" + _URLS["industry"].lstrip("/"),
             params={"symbol": _a_symbol(code)},
             headers={"Referer": "https://xueqiu.com/"},
             timeout=15,

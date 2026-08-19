@@ -15,6 +15,11 @@ import re
 import pandas as pd
 import requests
 
+from .sources import source_url
+
+# 批量快照接口地址（config.yaml: data_sources.tencent_spot.base_url 可改址覆盖）
+_QT_BASE = source_url("tencent_spot", "https://qt.gtimg.cn/q=")
+
 _COLUMNS = ["code", "name", "price", "total_mcap_local", "float_mcap_local", "pe_ttm"]
 
 
@@ -53,7 +58,7 @@ def fetch_spot(market: str, codes) -> pd.DataFrame | None:
     for i in range(0, len(tq), 150):
         chunk = tq[i:i + 150]
         try:
-            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(chunk), timeout=25)
+            r = requests.get(_QT_BASE + ",".join(chunk), timeout=25)
             txt = r.content.decode("gbk", "ignore")
         except Exception:  # noqa: BLE001
             continue

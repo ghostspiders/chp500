@@ -16,10 +16,14 @@ import pandas as pd
 
 from ..config import CONFIG
 from .cache import Cache
+from .sources import source_url, source_urls
 from .ttm_periods import compute_ttm_from_periods
 
 _UA = "chp500-index-research/0.1 (research project; contact: dev@chp500.local)"
-_BASE = "https://data.sec.gov/api/xbrl/companyconcept"
+
+# 接口地址（config.yaml: data_sources.sec_edgar 的 base_url/urls 可改址覆盖）
+_BASE = source_url("sec_edgar", "https://data.sec.gov/api/xbrl/companyconcept")
+_URLS = source_urls("sec_edgar", {"ticker_map": "https://www.sec.gov/files/company_tickers.json"})
 
 _CACHE = Cache(CONFIG["cache_dir"], ttl_days=CONFIG.get("cache_ttl_days", 7))
 
@@ -48,7 +52,7 @@ def _ticker_cik_map() -> dict[str, int]:
 
 
 def _fetch_ticker_map() -> dict | None:
-    data = _get_json("https://www.sec.gov/files/company_tickers.json")
+    data = _get_json(_URLS["ticker_map"])
     if not isinstance(data, dict):
         return None
     out = {}

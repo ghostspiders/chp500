@@ -42,12 +42,21 @@ def build_snapshot(as_of, mode, markets, universe="curated"):
         print(f"[snap] demo 模式：跨市场快照（markets={markets}）...")
         return adapters.build_cross_market_snapshot(as_of, markets)
     else:
-        # 生产模式：东财市值可达时
-        print("[snap] live 模式：抓取全 A 快照 ...")
-        universe = adapters.fetch_a_universe()
-        mcap = adapters.fetch_a_market_cap_em()
-        # TODO: 合并 quotes / earnings / liquidity（见 adapters 各函数）
-        raise NotImplementedError("live 模式需东财市值主机可达；本环境被墙，请用 demo。")
+        # live 生产模式：未实现（数据通路已收敛为腾讯快照 + Sina 行情 + EDGAR，可基于其补齐）
+        raise NotImplementedError("live 模式未实现；当前请使用 demo 模式。")
+
+
+def _clean_price(ser: pd.Series) -> pd.Series:
+    """剔除坏点：0 值，以及"单日跳变超 30% 且次日回到跳变前水平(±10%)"的异常尖刺
+    （典型为未复权缺口/异常 tick）。真实的持续暴涨暴跌予以保留，不得抹平。
+    """
+    ser = ser.replace(0, np.nan)
+    ret = ser.pct_change()
+    jump = ret.abs() > 0.30
+    revert = (ser.shift(-1) / ser.shift(1) - 1.0).abs() < 0.10
+    spike = jump & revert.fillna(False)
+    ser = ser.mask(spike, ser.shift(1))
+    return ser.ffill().bfill()
 
 
 def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
@@ -63,10 +72,9 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     eligible = screens.select_constituents(snapshot, as_of)
     print(f"[screen] 候选池={len(snapshot)} 通过准入后按规模选取={len(eligible)}（目标≤{n_target}）")
 
-    # 2) 行业分类 + 配比（快照已带 sector；若缺失则从 industry 映射）
-    elig = eligible
-    if "sector" not in elig.columns:
-        elig = classifier.add_sector(elig)
+    # 2) 行业分类 + 配比（扩展宇宙 A 股行业在此补齐：雪球，仅对入选成分抓取，缓存复用）
+    elig = adapters.attach_industry(eligible)
+    elig = classifier.add_sector(elig)
     elig = classifier.allocate(elig, CONFIG, weight_col="float_mcap")
 
     # 3) 权重计算
@@ -93,14 +101,6 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     fx_period = fxmod.fetch_fx_history(["USD", "HKD"], start, end)
 
     cny_prices = {}  # entity_id -> 每日 CNY 每股价格序列
-
-    def _clean_price(ser: pd.Series) -> pd.Series:
-        """剔除坏点：0 值、单日涨跌超 30%（疑似未复权缺口/异常 tick）用前值替代。"""
-        ser = ser.replace(0, np.nan)
-        ret = ser.pct_change()
-        bad = ret.abs() > 0.30
-        ser = ser.mask(bad, ser.shift(1))
-        return ser.ffill().bfill()
 
     # 按市场批量并发抓取历史行情（已按 code 全量缓存，重跑命中缓存）
     a_codes = constituents.loc[constituents["market"] == "A", "code"].tolist()
@@ -167,13 +167,14 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
         "shares_source_counts": {str(k): int(v) for k, v in src_shares.items()},
         "profit_source_counts": {str(k): int(v) for k, v in src_profit.items()},
         "real_shares_ratio": round(
-            src_shares.get("em", 0) / n_total, 4
+            src_shares.get("tencent", 0) / n_total, 4
         ),
         "real_profit_ratio": round(
-            (src_profit.get("em", 0) + src_profit.get("edgar", 0)) / n_total, 4
+            (src_profit.get("tencent", 0) + src_profit.get("edgar", 0)) / n_total, 4
         ),
         "config": CONFIG,
         "committee_summary": summary,
+        "total_return_note": "未接入分红数据，total_return 与 price_index 数值相同",
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[out] 元信息已写入 {out_dir / 'meta.json'}")

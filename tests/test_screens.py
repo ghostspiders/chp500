@@ -49,10 +49,11 @@ def test_iwf_boundary():
     assert _one({"iwf": 0.20})["pass_iwf"]
 
 
-def test_profit_requires_ttm_and_latest_quarter_positive():
-    assert not _one({"ttm_net_profit": 1e9, "latest_q_net_profit": 0.0})["pass_profit"]
-    assert not _one({"ttm_net_profit": -1.0, "latest_q_net_profit": 1e8})["pass_profit"]
-    assert _one({"ttm_net_profit": 1e9, "latest_q_net_profit": 1e8})["pass_profit"]
+def test_profit_requires_ttm_positive():
+    # 盈利门槛仅看 TTM>0（东财业绩源移除后无单季数据；PE 缺失 -> NaN 亦不通过）
+    assert not _one({"ttm_net_profit": -1.0})["pass_profit"]
+    assert not _one({"ttm_net_profit": float("nan")})["pass_profit"]
+    assert _one({"ttm_net_profit": 1e9})["pass_profit"]
 
 
 def test_liquidity_per_market_threshold():

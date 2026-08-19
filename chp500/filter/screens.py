@@ -2,7 +2,7 @@
 
 所有函数接收一份"快照"DataFrame（每行一只证券），列至少包含：
     entity_id, code, name, market, is_st, listing_date,
-    total_mcap, float_mcap, iwf, ttm_net_profit, latest_q_net_profit,
+    total_mcap, float_mcap, iwf, ttm_net_profit,
     liquidity_ratio, is_china
 并返回布尔 Series 或带原因的诊断表。
 """
@@ -33,8 +33,9 @@ def add_screen_diagnostics(df: pd.DataFrame, as_of: datetime, cfg: dict | None =
     out["pass_mcap"] = out["total_mcap"] >= cfg["mcap_min"]
     # 4) 自由流通比例
     out["pass_iwf"] = out["iwf"] >= cfg["iwf_min"]
-    # 5) 盈利门槛
-    out["pass_profit"] = (out["ttm_net_profit"] > 0) & (out["latest_q_net_profit"] > 0)
+    # 5) 盈利门槛：TTM 净利 > 0（腾讯快照 PE 推导，PE<=0 即亏损；缺失=未通过）。
+    #    原"最新单季>0"检查随东财业绩源（yjbb）移除而取消，见 README 已知限制。
+    out["pass_profit"] = out["ttm_net_profit"] > 0
     # 6) 流动性（跨市场分市场阈值）。A 股"6 个月累计成交量/自由流通股"的全额周转口径
     #    对大市值股普遍失真（大行等真实周转远低于 1.0），且扩展宇宙的自由流通股为合成近似；
     #    故 A 股下限仅设为 0.02（只剔除近零成交的失真/僵尸样本），港股/美股沿用 0.30。

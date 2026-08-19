@@ -3,14 +3,14 @@
 已验证在本环境可用的接口（探针结果）：
   - stock_info_a_code_name   : A 股代码/名称（可用）
   - stock_zh_a_spot          : Sina 批量现价/成交量（可用，但无市值）
-  - stock_yjbb_em(date=...)  : 批量业绩报表（净利润 + 所处行业，可用）
   - stock_zh_a_daily         : Sina A 股日线（东财历史主机被墙，改用 Sina）
   - stock_hk_daily           : Sina 港股日线（可用，港股无东财墙）
   - stock_us_daily           : Sina 美股日线（可用）
   - currency_boc_sina        : 中行历史汇率（USD/HKD -> CNY，可用）
-  - stock_financial_hk_report_em : 港股三大报表（需国内网络/VPN；不可达报错终止）
-  另见 em_snapshot.py（东财 push2 三市场市值/股本快照，需国内网络/VPN）
-  与 edgar.py（SEC EDGAR 美股净利，免认证）。
+  另见 spot.py（腾讯行情三市场市值/股本/PE 快照，TTM 净利由 总市值/PE(TTM) 推导）、
+  xueqiu.py（雪球 A 股行业）、edgar.py（SEC EDGAR 美股净利，免认证）。
+  原东财 yjbb_em / 东财港股财报通路已移除（减少数据源；见 README 数据源说明）；
+  HK/US 行业由参考表（demo_hk/demo_us.csv）人工核定提供（免费接口无港美行业字段）。
 """
 
 from __future__ import annotations
@@ -30,16 +30,12 @@ import requests
 from ..config import BASE_DIR, CONFIG
 from . import edgar, fx
 from .cache import Cache
-from .em_snapshot import get_em_spot
+from .spot import fetch_spot
+from .xueqiu import fetch_a_industry
 from .merge import merge_entities
-from .ttm_periods import compute_ttm_from_periods
 
 DATA_DIR = BASE_DIR / "data"
 CACHE = Cache()
-
-# 业绩抓取结果完整性护栏：9 个报告期 × ~5500 只 ≈ 4.5~6 万行；低于此值视为东财
-# yjbb_em 返回残缺，不缓存（下次重新抓取）。
-_EARN_MIN_ROWS = 30000
 
 
 # ---------------------------------------------------------------------------
@@ -115,125 +111,6 @@ def _fetch_a_quotes_tencent() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["code", "name", "price", "volume", "amount"])
 
 
-# ---------------------------------------------------------------------------
-# 业绩 / 行业（批量）
-# ---------------------------------------------------------------------------
-def _quarter_ends(upto: datetime, n: int = 9) -> list[str]:
-    """生成截至 upto 的最近 n 个报告期（0331/0630/0930/1231）。"""
-    ends = []
-    d = pd.Timestamp(upto)
-    q_end_months = [(3, 31), (6, 30), (9, 30), (12, 31)]
-    cur = None
-    for y in range(d.year - 1, d.year + 1):
-        for m, day in q_end_months:
-            cand = pd.Timestamp(y, m, day)
-            if cand <= d:
-                cur = cand
-    q = cur
-    while len(ends) < n:
-        ends.append(q.strftime("%Y%m%d"))
-        if q.month == 3:
-            q = pd.Timestamp(q.year - 1, 12, 31)
-        else:
-            q = pd.Timestamp(q.year, q.month - 3, [31, 31, 30, 30][q.month // 3 - 1])
-    return ends  # 由近到远
-
-
-def fetch_a_earnings(as_of: datetime | None = None, dates: list[str] | None = None, force: bool = False) -> pd.DataFrame:
-    """批量抓取多个报告期的净利润与行业，返回长表。
-
-    列：code, date(报告期), net_profit, industry。
-
-    东财 yjbb_em 偶发被拦截/返回残缺数据，故加 7 天缓存：首次抓到"完整"结果
-    （行数 >= _EARN_MIN_ROWS）即落盘，后续 7 天内直接复用，避免构建时撞上东财
-    间歇不可用而只剩零星成分。残缺结果（< 阈值）不缓存，下次重新抓取。
-    """
-    as_of = pd.Timestamp(as_of or datetime.now())
-    if dates is None:
-        dates = _quarter_ends(as_of, n=9)
-    cache_key = f"a_earnings_{as_of.date()}"
-    if not force:
-        cached = CACHE.get(cache_key)
-        if cached is not None and len(cached) >= _EARN_MIN_ROWS:
-            return cached
-    rows = []
-    for dt in dates:
-        df = None
-        for _ in range(3):  # 东财 yjbb_em 偶发被拦截，重试
-            try:
-                df = ak.stock_yjbb_em(date=dt)
-                if df is not None and not df.empty:
-                    break
-            except Exception:  # noqa: BLE001
-                time.sleep(2)
-        if df is None or df.empty:
-            continue
-        sub = df[["股票代码", "净利润-净利润", "所处行业"]].copy()
-        sub["date"] = dt
-        sub = sub.rename(columns={"股票代码": "code", "净利润-净利润": "net_profit", "所处行业": "industry"})
-        sub["code"] = sub["code"].astype(str).str.zfill(6)
-        rows.append(sub)
-    if not rows:
-        return pd.DataFrame(columns=["code", "date", "net_profit", "industry"])
-    out = pd.concat(rows, ignore_index=True)
-    # 仅当结果看起来完整时才缓存（覆盖旧的可能残缺缓存）
-    if len(out) >= _EARN_MIN_ROWS:
-        CACHE.put(cache_key, out)
-    return out
-
-
-def compute_ttm_earnings(earnings_long: pd.DataFrame, as_of: datetime | None = None) -> pd.DataFrame:
-    """由业绩长表计算每只股票的 TTM 净利润、最新单季净利润、行业。
-
-    报告期为"累计值"。正确 TTM 公式：
-        TTM(截至最新季) = C(最新季) - C(去年同季) + FY(去年)
-    最新单季 = C(最新季) - C(上一季累计)（Q1 则 = C(最新季)）。
-    """
-    if earnings_long.empty:
-        return pd.DataFrame(columns=["code", "ttm_net_profit", "latest_q_net_profit", "industry"])
-    earnings_long = earnings_long.drop_duplicates(subset=["code", "date"], keep="first")
-
-    _QMAP = {"Q1": "0331", "Q2": "0630", "Q3": "0930", "Q4": "1231"}
-
-    def qtype(d: str) -> str:
-        m = int(d[4:6])
-        return {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}[m]
-
-    ind = earnings_long.sort_values("date").groupby("code")["industry"].last()
-
-    results = {}
-    for code, grp in earnings_long.groupby("code"):
-        ser = grp.set_index("date")["net_profit"]
-        ser = ser[ser.notna()]
-        if ser.empty:
-            continue
-        latest = ser.index.max()
-        y, m = int(latest[:4]), int(latest[4:6])
-        qt = qtype(latest)
-        c_latest = ser[latest]
-        d_sameq_py = f"{y-1}{_QMAP[qt]}"
-        c_sameq_py = ser.get(d_sameq_py, np.nan)
-        d_fy_py = f"{y-1}1231"
-        c_fy_py = ser.get(d_fy_py, np.nan)
-        if pd.notna(c_latest) and pd.notna(c_sameq_py) and pd.notna(c_fy_py):
-            ttm = c_latest - c_sameq_py + c_fy_py
-        else:
-            ttm = np.nan
-        if qt == "Q1":
-            latest_q = c_latest
-        else:
-            d_prevq = f"{y}{_QMAP[{'Q2': 'Q1', 'Q3': 'Q2', 'Q4': 'Q3'}[qt]]}"
-            c_prevq = ser.get(d_prevq, np.nan)
-            latest_q = c_latest - c_prevq if pd.notna(c_prevq) else np.nan
-        results[code] = {"ttm_net_profit": ttm, "latest_q_net_profit": latest_q}
-
-    out = pd.DataFrame.from_dict(results, orient="index").reset_index().rename(columns={"index": "code"})
-    out["industry"] = out["code"].map(ind)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 历史行情 / 流动性（A 股：Sina daily）
 # ---------------------------------------------------------------------------
 def _sina_a_daily(code: str) -> pd.DataFrame | None:
     """抓取单只 A 股全量日线（Sina，前复权）。返回 date/open/high/low/close/volume。
@@ -382,26 +259,15 @@ def fetch_hk_us_hist(codes, market: str, start: str, end: str, workers: int = 12
 
 
 # ---------------------------------------------------------------------------
-# 生产用市值（东财实时主机，本环境被墙；生产环境启用）
-# ---------------------------------------------------------------------------
-def fetch_a_market_cap_em() -> pd.DataFrame:
-    """东财批量市值。本环境会被防火墙 RESET，生产环境可用。"""
-    df = ak.stock_zh_a_spot_em()
-    df = df.rename(columns={"代码": "code", "名称": "name", "总市值": "total_mcap", "流通市值": "float_mcap"})
-    df["code"] = df["code"].astype(str).str.zfill(6)
-    return df[["code", "name", "total_mcap", "float_mcap"]]
-
-
-# ---------------------------------------------------------------------------
-# 各市场 listing 级快照
-# ---------------------------------------------------------------------------
 def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
     """A 股 listing 级快照（严格真实模式）。
 
-    - 市值/股本/IWF：东财 push2 真实快照（需国内网络/VPN），不可达直接报错终止；
-    - 现价：Sina（与东财快照价一致，作为基准），东财将覆盖为权威价；
-    - 净利润/行业：东财 yjbb_em 真实财报；
-    - 流动性：Sina daily 成交量 / 东财真实自由流通股。
+    - 市值/股本/IWF/TTM 净利：腾讯行情快照，不可达直接报错终止；
+      TTM 净利 = 总市值/PE(TTM) 推导（实测与东财业绩真值偏差<0.1%，
+      亏损股 PE 为负、符号可靠）；
+    - 现价：Sina（与腾讯快照价一致，作为基准），腾讯将覆盖为权威价；
+    - 行业：雪球 affiliate_industry（无静态兜底），取不到真实行业者剔除；
+    - 流动性：Sina daily 成交量 / 腾讯真实自由流通股。
     不再有任何近似回落（reference/synthetic/static）。
     """
     from ..sector.classifier import map_to_sector
@@ -413,18 +279,18 @@ def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
     quotes = fetch_a_quotes_sina()
     qmap = quotes.set_index("code")[["price"]]
 
-    earnings = fetch_a_earnings(as_of)
-    earn = compute_ttm_earnings(earnings, as_of)
+    ind = fetch_a_industry(ref["code"].astype(str).tolist())
+    if not ind:
+        raise RuntimeError("雪球行业源不可用：无法获取 A 股真实行业，构建已终止。")
+    ref = ref[ref["code"].isin(ind)].copy()
 
     start = (as_of - timedelta(days=200)).strftime("%Y%m%d")
     end = as_of.strftime("%Y%m%d")
     _, volumes = fetch_hist(ref["code"].tolist(), start, end)
 
-    em = get_em_spot("A", codes=ref["code"].astype(str).tolist())
-    if em is None or em.empty:
-        raise RuntimeError(
-            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，构建已终止。"
-        )
+    spot = fetch_spot("A", ref["code"].astype(str).tolist())
+    if spot is None or spot.empty:
+        raise RuntimeError("腾讯行情（A 股快照）不可达：无法获取真实市值/股本，构建已终止。")
 
     out = pd.DataFrame({
         "entity_id": ref["entity_id"].values,
@@ -437,79 +303,54 @@ def build_a_listing_snapshot(as_of: datetime | None = None) -> pd.DataFrame:
         "listing_date": pd.to_datetime(ref["listing_date"]).values,
     })
     out["price"] = out["code"].map(qmap["price"])
-    out["ttm_net_profit"] = out["code"].map(earn.set_index("code")["ttm_net_profit"])
-    out["latest_q_net_profit"] = out["code"].map(earn.set_index("code")["latest_q_net_profit"])
-    out["industry"] = out["code"].map(earn.set_index("code")["industry"])
-    out["sector"] = out["industry"].map(map_to_sector)
 
-    # 东财 push2 真实市值/股本（严格：不可达已在上游报错，绝不回落参考/合成）
-    out = apply_em_shares_local(out, em, fxr=1.0)
+    # 腾讯行情真实市值/股本 + PE 推导 TTM 净利（严格：不可达已在上游报错，绝不回落参考/合成）
+    out = apply_spot_shares(out, spot, fxr=1.0)
+
+    out["industry"] = out["code"].map(ind)
+    out["sector"] = out["industry"].map(map_to_sector)
 
     float_shares_series = pd.Series(out["float_shares"].values, index=out["code"].values)
     liq = compute_liquidity(volumes, float_shares_series)
     out["liquidity_ratio"] = out["code"].map(liq)
-    out["profit_source"] = "em"
     return out
 
+def apply_spot_shares(out: pd.DataFrame, spot: pd.DataFrame | None, fxr: float) -> pd.DataFrame:
+    """用腾讯行情真实快照覆盖价格/股本/市值/TTM 净利（本币与 CNY）。
 
-_HK_PROFIT_ITEM = "股东应占溢利"  # 归母净利润科目（港股利润表）
-
-
-def fetch_hk_profit_periods(code: str):
-    """港股净利润披露期 [(start, end, value), ...]（年度+中期合并，累计口径）。
-
-    金额为报告货币；本指数的中资股名单绝大多数以 CNY 报告（近似，个别
-    USD 报告者如中芯国际存在未折算偏差，见 README 数据源说明）。失败返回 None。
+    - shares_source=tencent；TTM 净利 = 总市值(CNY)/PE(TTM)，profit_source=tencent：
+      PE>0 盈利、PE<0 亏损（符号可靠，量级实测偏差<0.1%）、PE 缺失置 NaN 由盈利筛选剔除；
+      美股不在此推导（由 SEC EDGAR 权威覆盖，保持 profit_source=missing）。
+    - 严格模式：spot 不可达（None/空）直接抛出 RuntimeError，绝不降级到参考/合成/静态近似值。
+      个股未命中（停牌/未收录）标记 shares_source="missing" 并将市值/股本/净利置 NaN，
+      由下游筛选剔除（不做近似回填）。
     """
-    def _fetch():
-        parts = []
-        for ind in ("年度", "中期"):
-            try:
-                df = ak.stock_financial_hk_report_em(
-                    stock=str(code).zfill(5), symbol="利润表", indicator=ind
-                )
-            except Exception:  # noqa: BLE001
-                continue
-            if df is None or df.empty:
-                continue
-            sub = df[df["STD_ITEM_NAME"] == _HK_PROFIT_ITEM]
-            for _, r in sub.iterrows():
-                parts.append((
-                    pd.Timestamp(r["START_DATE"]),
-                    pd.Timestamp(r["REPORT_DATE"]),
-                    float(r["AMOUNT"]),
-                ))
-        return pd.DataFrame(parts, columns=["start", "end", "value"]) if parts else None
-
-    df = CACHE.get_or_fetch(f"hk_profit_{str(code)}", _fetch)
-    if df is None or (hasattr(df, "empty") and df.empty):
-        return None
-    return [(r[0], r[1], r[2]) for r in df.itertuples(index=False, name=None)]
-
-
-def apply_em_shares_local(out: pd.DataFrame, em: pd.DataFrame | None, fxr: float) -> pd.DataFrame:
-    """用东财 push2 真实快照覆盖价格/股本/市值（本币与 CNY），标记 shares_source=em。
-
-    严格模式：em 不可达（None/空）直接抛出 RuntimeError，绝不降级到参考/合成/静态近似值。
-    个股未命中（停牌/未收录）标记 shares_source="missing" 并将市值/股本置 NaN，
-    由下游筛选剔除（不做近似回填）。
-    """
-    if em is None or em.empty:
+    if spot is None or spot.empty:
         raise RuntimeError(
-            "东财 push2 快照不可达（需国内网络/VPN）：无法获取真实市值/股本，已终止以避免使用近似数据。"
+            "腾讯行情快照不可达：无法获取真实市值/股本，已终止以避免使用近似数据。"
         )
     out = out.copy()
-    m = em.set_index("code")
+    # 先确保所有目标列存在（.loc 对缺失列赋值在部分 pandas 版本不可靠）
+    _need_cols = ["total_shares", "float_shares", "iwf",
+                  "total_mcap_local", "float_mcap_local",
+                  "total_mcap", "float_mcap",
+                  "ttm_net_profit", "latest_q_net_profit"]
+    for c in _need_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    m = spot.set_index("code")
     hit = out["code"].isin(m.index)
     idx = out.index[hit]
     if not len(idx):
-        raise RuntimeError("东财 push2 快照未覆盖任何成分代码，无法获取真实市值/股本。")
+        raise RuntimeError("腾讯行情快照未覆盖任何成分代码，无法获取真实市值/股本。")
     price = out.loc[idx, "code"].map(m["price"]).astype(float)
     tm = out.loc[idx, "code"].map(m["total_mcap_local"]).astype(float)
     fm = out.loc[idx, "code"].map(m["float_mcap_local"]).astype(float)
+    pe = (out.loc[idx, "code"].map(m["pe_ttm"]).astype(float)
+          if "pe_ttm" in m.columns else pd.Series(np.nan, index=idx))
     valid = price > 0
     idx = idx[valid]
-    price, tm, fm = price[valid], tm[valid], fm[valid]
+    price, tm, fm, pe = price[valid], tm[valid], fm[valid], pe[valid]
     out.loc[idx, "price"] = price
     out.loc[idx, "total_shares"] = tm / price
     out.loc[idx, "float_shares"] = fm / price
@@ -518,22 +359,34 @@ def apply_em_shares_local(out: pd.DataFrame, em: pd.DataFrame | None, fxr: float
     out.loc[idx, "float_mcap_local"] = fm
     out.loc[idx, "total_mcap"] = tm * fxr  # 折算 CNY
     out.loc[idx, "float_mcap"] = fm * fxr
-    out.loc[idx, "shares_source"] = "em"
+    out.loc[idx, "shares_source"] = "tencent"
+    # TTM 净利（CNY）= 总市值 / PE(TTM)；PE=0/缺失 -> NaN；美股留给 EDGAR
+    if "market" in out.columns:
+        use_pe = out.loc[idx, "market"] != "US"
+    else:
+        use_pe = pd.Series(True, index=idx)
+    ttm = (tm * fxr) / pe.replace(0.0, np.nan)
+    out.loc[idx, "ttm_net_profit"] = ttm.where(use_pe)
+    # 单季净利随东财业绩源移除不再可得，保留列以维持 schema（盈利筛选已改为仅 TTM>0）
+    out.loc[idx, "latest_q_net_profit"] = np.nan
+    out.loc[idx, "profit_source"] = np.where(use_pe, "tencent", "missing")
     # 未命中个股：无真实市值/股本，置缺失并标记，下游筛选自然剔除（不回填近似）。
     uncovered = out.index.difference(idx)
-    out.loc[uncovered, ["total_shares", "float_shares", "iwf",
-                        "total_mcap_local", "float_mcap_local",
-                        "total_mcap", "float_mcap"]] = np.nan
+    out.loc[uncovered, _need_cols] = np.nan
     out.loc[uncovered, "shares_source"] = "missing"
+    out.loc[uncovered, "profit_source"] = "missing"
     return out
 
 
 def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.DataFrame:
-    """用真实财务源覆盖 TTM/最新单季：HK=东财港股财报，US=SEC EDGAR。
+    """美股净利：SEC EDGAR 真实覆盖 TTM/最新单季。
 
+    HK/A 的 TTM 净利已由 apply_spot_shares 以腾讯 PE 推导，本函数仅处理 US。
     严格模式：失败个股标记 profit_source="missing" 并将净利润置 NaN，由下游盈利筛选剔除；
-    不再回落静态近似值。若整批均无真实财务（源整体不可用），抛出 RuntimeError。
+    不再回落静态近似值。若整批均无真实财务（EDGAR 整体不可用），抛出 RuntimeError。
     """
+    if market != "US":
+        return out
     out = out.copy()
     out["ttm_net_profit"] = np.nan
     out["latest_q_net_profit"] = np.nan
@@ -541,77 +394,30 @@ def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.Da
     got_real = False
     for i, r in out.iterrows():
         try:
-            if market == "HK":
-                periods = fetch_hk_profit_periods(r["code"])
-                res = compute_ttm_from_periods(periods) if periods else None
-                if res and res["ttm"] is not None:
-                    out.loc[i, "ttm_net_profit"] = res["ttm"]
-                    out.loc[i, "latest_q_net_profit"] = res["latest_q"]
-                    out.loc[i, "profit_source"] = "em"
-                    got_real = True
-            else:
-                res = edgar.fetch_us_net_income(r["code"], usd_cny=usd_cny)
-                if res is not None:
-                    out.loc[i, "ttm_net_profit"] = res["ttm"]
-                    out.loc[i, "latest_q_net_profit"] = res["latest_q"]
-                    out.loc[i, "profit_source"] = "edgar"
-                    got_real = True
+            res = edgar.fetch_us_net_income(r["code"], usd_cny=usd_cny)
+            if res is not None:
+                out.loc[i, "ttm_net_profit"] = res["ttm"]
+                out.loc[i, "latest_q_net_profit"] = res["latest_q"]
+                out.loc[i, "profit_source"] = "edgar"
+                got_real = True
         except Exception:  # noqa: BLE001
             continue
     if not got_real:
         raise RuntimeError(
-            f"{market} 真实财务源整体不可用（东财港股财报 / SEC EDGAR）：无法获取真实净利润，构建已终止。"
+            "US 真实财务源（SEC EDGAR）整体不可用：无法获取真实净利润，构建已终止。"
         )
     return out
-
-
-def fetch_hk_us_sector(codes, market: str) -> dict:
-    """真实行业（Xueqiu 个股 basic info），返回 {code: 行业中文}。
-
-    严格模式：无静态兜底。任一股票取不到真实行业则不计入（由 build_* 剔除）。
-    """
-    import akshare as ak
-
-    func = ak.stock_individual_basic_info_hk_xq if market == "HK" else ak.stock_individual_basic_info_us_xq
-    out: dict = {}
-    for c in codes:
-        try:
-            df = func(symbol=str(c))
-        except Exception:  # noqa: BLE001
-            continue
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            continue
-        rec: dict = {}
-        if isinstance(df, pd.DataFrame) and {"item", "value"}.issubset(df.columns):
-            rec = dict(zip(df["item"].astype(str), df["value"].astype(str)))
-        for col in ("行业", "板块", "industry", "sector"):
-            if col in getattr(df, "columns", []):
-                val = df[col].iloc[0]
-                if pd.notna(val):
-                    rec.setdefault("industry", str(val))
-        ind = rec.get("行业") or rec.get("板块") or rec.get("industry") or rec.get("sector")
-        if ind:
-            out[str(c)] = str(ind)
-    return out
-
-
-def _first_listed_date(code: str, market: str) -> pd.Timestamp:
-    """真实上市日：由 Sina 全量日线首日推导（缓存命中，无需另抓历史）。"""
-    df = _cached_hk_us_daily(str(code), market)
-    if df is None or df.empty:
-        return pd.NaT
-    s = df["date"].dropna()
-    return s.min() if not s.empty else pd.NaT
 
 
 def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: pd.DataFrame) -> pd.DataFrame:
     """港股/美股 listing 级快照（严格真实模式）。
 
-    - 行业：真实 Xueqiu 个股行业（无静态兜底），取不到真实行业的股票直接剔除；
+    - 行业：参考表人工核定（demo_hk/demo_us 的 industry 列；港美免费行情接口
+      无行业字段，见 README 已知限制；展示字段，不参与权重/筛选）；
     - 上市日：真实 Sina 全量日线首日推导（无静态兜底）；
-    - 股本/市值：东财 push2 真实快照（需国内网络/VPN），不可达直接报错终止；
-    - 财务：HK=东财港股财报（TTM+单季），US=SEC EDGAR；不可达/缺失标记 missing 由筛选剔除；
-    - 现价/成交量：Sina daily（价格与东财快照价一致）。
+    - 股本/市值：腾讯行情真实快照，不可达直接报错终止；
+    - 财务：HK=腾讯快照 PE 推导 TTM；US=SEC EDGAR；缺失标记 missing 由筛选剔除；
+    - 现价/成交量：Sina daily（价格与腾讯快照价一致）。
     不再有任何近似回落（reference/synthetic/static）。
     """
     from ..sector.classifier import map_to_sector
@@ -624,28 +430,15 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     codes = ref["code"].astype(str).tolist()
     prices = fetch_hk_us_price(codes, market, as_of)
 
-    # 真实行业（无静态兜底）：取不到真实行业的股票剔除
-    sec = fetch_hk_us_sector(codes, market)
-    keep = [c for c in codes if c in sec]
-    if not keep:
-        print(f"[warn] {market} 真实行业源整体不可用（无任一股票取得真实行业），该市场成分暂为空。")
-        return pd.DataFrame(columns=[
-            "entity_id", "code", "name", "market", "curr", "is_st", "is_china",
-            "price", "total_shares", "float_shares", "iwf", "total_mcap", "float_mcap",
-            "ttm_net_profit", "latest_q_net_profit", "industry", "sector",
-            "liquidity_ratio", "listing_date", "shares_source", "profit_source",
-        ])
-    ref = ref[ref["code"].astype(str).isin(keep)].copy()
-
     start = (as_of - timedelta(days=200)).strftime("%Y%m%d")
     end = as_of.strftime("%Y%m%d")
-    _, volumes = fetch_hk_us_hist(keep, market, start, end)
+    _, volumes = fetch_hk_us_hist(codes, market, start, end)
 
     fxr = fx.fx_rate_on(fx_table, as_of, curr)
-    em = get_em_spot(market, codes=ref["code"].astype(str).tolist())
-    if em is None or em.empty:
+    spot = fetch_spot(market, ref["code"].astype(str).tolist())
+    if spot is None or spot.empty:
         raise RuntimeError(
-            f"东财 push2（{market} 快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，构建已终止。"
+            f"腾讯行情（{market} 快照）不可达：无法获取真实市值/股本，构建已终止。"
         )
 
     out = pd.DataFrame({
@@ -659,13 +452,13 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     })
     out["price"] = out["code"].map(prices)
 
-    # 东财真实股本/市值（严格：不可达已在上游报错）
-    out = apply_em_shares_local(out, em, fxr)
-    # 真实财务覆盖（HK=东财财报 / US=SEC EDGAR）；缺失标记 missing，不回落静态
+    # 腾讯真实股本/市值 + PE 推导 TTM 净利（严格：不可达已在上游报错）
+    out = apply_spot_shares(out, spot, fxr)
+    # 真实财务覆盖：US=SEC EDGAR（HK 已由腾讯 PE 推导）；缺失标记 missing，不回落静态
     out = apply_real_earnings(out, market, usd_cny=fx.fx_rate_on(fx_table, as_of, "USD"))
 
-    # 真实行业 + GICS 映射（行业取不到的已在上游剔除）
-    out["industry"] = out["code"].map(sec)
+    # 行业：参考表人工核定 + GICS 映射（展示字段）
+    out["industry"] = out["code"].map(ref.set_index("code")["industry"])
     out["sector"] = out["industry"].map(map_to_sector)
     # 真实上市日（Sina 全量日线首日推导）
     out["listing_date"] = out["code"].map(lambda c: _first_listed_date(c, market))
@@ -674,6 +467,35 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     liq = compute_liquidity(volumes, float_shares_series)
     out["liquidity_ratio"] = out["code"].map(liq)
     return out
+
+
+def attach_industry(df: pd.DataFrame) -> pd.DataFrame:
+    """为缺少行业的成分（扩展宇宙 A 股，选样后）补齐雪球真实行业。
+
+    全量 A 股逐个抓雪球不现实，故扩展宇宙在快照阶段不取行业，入选成分后在此补齐
+    （结果缓存，重跑秒级）。仅处理 market=A 且 industry 为空的行；抓取失败者保持空，
+    板块映射时归入"其他"。HK/US 行业已在快照构建时取得。
+    """
+    out = df.copy()
+    if "industry" not in out.columns:
+        out["industry"] = None
+    need = out["industry"].isna() | (out["industry"].astype(str).str.strip() == "")
+    if "market" in out.columns:
+        need &= out["market"] == "A"
+    codes = out.loc[need, "code"].astype(str).tolist()
+    if codes:
+        ind = fetch_a_industry(codes)
+        out.loc[need, "industry"] = out.loc[need, "code"].astype(str).map(ind)
+    return out
+
+
+def _first_listed_date(code: str, market: str) -> pd.Timestamp:
+    """真实上市日：由 Sina 全量日线首日推导（缓存命中，无需另抓历史）。"""
+    df = _cached_hk_us_daily(str(code), market)
+    if df is None or df.empty:
+        return pd.NaT
+    s = df["date"].dropna()
+    return s.min() if not s.empty else pd.NaT
 
 
 def build_cross_market_snapshot(as_of: datetime | None = None, markets: list[str] | None = None) -> pd.DataFrame:

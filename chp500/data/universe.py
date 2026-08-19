@@ -1,11 +1,13 @@
 """扩展宇宙（演示规模推向 ~500 成分，严格真实模式）。
 
 数据源：
-  - A 股公司名/现价/TTM 净利/行业/成交量：真实（Sina + 东财 yjbb）。
-  - 总股本/流通股本/IWF：东财 push2 快照（真实，需国内网络或 VPN）；
-    不可达直接报错终止（绝不回落合成/静态近似）。
+  - A 股公司名/现价：真实（Sina）；成交量：Sina 日线。
+  - 总股本/流通股本/IWF/TTM 净利：腾讯行情快照（真实；净利=总市值/PE(TTM) 推导，
+    实测偏差<0.1%）；不可达直接报错终止（绝不回落合成/静态近似）。
+  - A 股行业：快照阶段不取（全量 5000+ 只逐个抓不现实），入选成分后由
+    雪球补齐（见 adapters.attach_industry）。
   - demo_universe.csv 蓝筹仅用于提供跨市场 entity_id 与上市日（保证去重），
-    股本/市值一律以东财 push2 真实值为准。
+    股本/市值一律以腾讯行情真实值为准。
 """
 
 from __future__ import annotations
@@ -15,60 +17,19 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import BASE_DIR, CONFIG
-from ..sector.classifier import map_to_sector
 from . import adapters
 from .adapters import (
     fetch_a_quotes_sina,
-    fetch_a_earnings,
-    compute_ttm_earnings,
     fetch_hist,
     compute_liquidity,
     build_hk_us_listing_snapshot,
     fetch_hk_us_hist,
 )
 from . import fx
-from .em_snapshot import get_em_spot
+from .spot import fetch_spot
 from .merge import merge_entities
 
 DATA_DIR = BASE_DIR / "data"
-
-
-def apply_em_shares(df: pd.DataFrame, em: pd.DataFrame | None) -> pd.DataFrame:
-    """用东财快照替换股本：总股本=总市值/价、流通股本=流通市值/价、IWF=流通/总。
-
-    严格模式：em 不可达（None/空）直接报错，绝不回落合成/静态近似。
-    个股未命中标记 shares_source="missing" 并置 NaN，由下游筛选剔除。
-    """
-    if em is None or em.empty:
-        raise RuntimeError(
-            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，扩展宇宙构建已终止。"
-        )
-    out = df.copy()
-    out["shares_source"] = "missing"
-    m = em.set_index("code")
-    hit = out["code"].isin(m.index)
-    idx = out.index[hit]
-    if not len(idx):
-        return out
-    em_price = out.loc[idx, "code"].map(m["price"]).astype(float)
-    em_tm = out.loc[idx, "code"].map(m["total_mcap_local"]).astype(float)
-    em_fm = out.loc[idx, "code"].map(m["float_mcap_local"]).astype(float)
-    valid = em_price > 0
-    idx = idx[valid]
-    em_price, em_tm, em_fm = em_price[valid], em_tm[valid], em_fm[valid]
-    out.loc[idx, "price"] = em_price
-    out.loc[idx, "total_shares"] = em_tm / em_price
-    out.loc[idx, "float_shares"] = em_fm / em_price
-    out.loc[idx, "iwf"] = em_fm / em_tm
-    out.loc[idx, "total_mcap"] = em_tm  # A 股快照本币即 CNY
-    out.loc[idx, "float_mcap"] = em_fm
-    out.loc[idx, "shares_source"] = "em"
-    # 未命中个股：无真实市值/股本，置缺失并标记，下游筛选自然剔除（不回填合成近似）。
-    uncovered = out.index.difference(idx)
-    if len(uncovered):
-        out.loc[uncovered, ["total_shares", "float_shares", "iwf",
-                            "total_mcap", "float_mcap"]] = float("nan")
-    return out
 
 
 def _expanded_a_listing(as_of) -> pd.DataFrame:
@@ -82,16 +43,10 @@ def _expanded_a_listing(as_of) -> pd.DataFrame:
     qmap = fetch_a_quotes_sina().set_index("code")
     price = info["code"].map(qmap["price"])
 
-    # 3) 真实 TTM 净利 / 行业
-    earn = compute_ttm_earnings(fetch_a_earnings(as_of), as_of)
-    ttm = info["code"].map(earn.set_index("code")["ttm_net_profit"])
-    latest_q = info["code"].map(earn.set_index("code")["latest_q_net_profit"])
-    industry = info["code"].map(earn.set_index("code")["industry"])
-
-    em = get_em_spot("A", codes=info["code"].astype(str).tolist())
-    if em is None or em.empty:
+    spot = fetch_spot("A", info["code"].astype(str).tolist())
+    if spot is None or spot.empty:
         raise RuntimeError(
-            "东财 push2（A 股快照）不可达（需国内网络/VPN）：无法获取真实市值/股本，扩展宇宙构建已终止。"
+            "腾讯行情（A 股快照）不可达：无法获取真实市值/股本，扩展宇宙构建已终止。"
         )
 
     out = pd.DataFrame({
@@ -101,20 +56,19 @@ def _expanded_a_listing(as_of) -> pd.DataFrame:
         "market": "A",
         "curr": "CNY",
         "price": price,
-        "ttm_net_profit": ttm,
-        "latest_q_net_profit": latest_q,
-        "industry": industry,
+        "ttm_net_profit": float("nan"),
+        "latest_q_net_profit": float("nan"),
+        "industry": None,  # 选样后由雪球补齐（attach_industry），全量逐个抓不现实
         "is_st": info["name"].str.contains("ST", case=False, na=False),
         "is_china": True,
         "listing_date": pd.NaT,
     })
-    out["sector"] = out["industry"].map(map_to_sector)
 
-    # 4) 东财真实股本/市值（严格：不可达已报错；缺失标记 missing，不回落合成）
-    out = apply_em_shares(out, em)
+    # 3) 腾讯真实股本/市值 + PE 推导 TTM 净利（严格：不可达已报错；缺失标记 missing，不回落合成）
+    out = adapters.apply_spot_shares(out, spot, fxr=1.0)
 
-    # 5) 真实大市值蓝筹沿用 curated 参考表的 entity_id 与上市日（保证跨市场去重）；
-    #    股本/市值一律以东财 push2 真实值为准（不再用参考表近似）。
+    # 4) 真实大市值蓝筹沿用 curated 参考表的 entity_id 与上市日（保证跨市场去重）；
+    #    股本/市值一律以腾讯行情真实值为准（不再用参考表近似）。
     cur = pd.read_csv(DATA_DIR / "demo_universe.csv", dtype={"code": str})
     cur["code"] = cur["code"].str.zfill(6)
     for _, r in cur.iterrows():
@@ -187,10 +141,10 @@ def build_expanded_cross_market_snapshot(as_of, markets=None) -> pd.DataFrame:
 
 
 def persist_expanded_a_universe(as_of, path=None) -> pd.DataFrame:
-    """落盘扩展 A 股宇宙（真实名 + 近似股本），便于审阅与复现。"""
+    """落盘扩展 A 股宇宙（真实名 + 腾讯真实股本/PE 推导净利），便于审阅与复现。"""
     out = _expanded_a_listing(as_of)
     out = out[["entity_id", "code", "name", "total_shares", "iwf", "listing_date",
-               "sector", "ttm_net_profit", "price", "total_mcap"]]
+               "ttm_net_profit", "price", "total_mcap"]]
     path = Path(path or DATA_DIR / "demo_universe_expanded.csv")
     out.to_csv(path, index=False, encoding="utf-8-sig")
     return out

@@ -49,6 +49,6 @@ markets:                     # 覆盖市场
   - US
 
 # ---- 数据源 ----
-data_source: akshare         # 主数据源：akshare（Sina 行情 / 东财 yjbb_em / 东财 push2 / SEC EDGAR / 中行汇率）
+data_source: akshare         # 主数据源：akshare（Sina 行情 / 雪球行业 / 中行汇率）+ 腾讯行情快照（市值/股本/PE推导净利）+ SEC EDGAR（美股净利）
 cache_dir: .cache            # 数据缓存目录（parquet）
 cache_ttl_days: 7            # 缓存有效期（天）：调小更即时但增加 AkShare 抓取量；留空/0 表示永不过期

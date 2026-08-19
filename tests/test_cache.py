@@ -82,3 +82,43 @@ def test_empty_fetch_not_cached(tmp_path):
     assert not c.exists("k")
     c.get_or_fetch("none", lambda: None)
     assert not c.exists("none")
+
+
+def test_dict_roundtrip_via_json(tmp_path):
+    # 回归：dict fetcher 曾因 get_or_fetch 调 df.empty 抛 AttributeError（EDGAR bug 根因）
+    c = Cache(tmp_path / "cache", ttl_days=None)
+    calls = {"n": 0}
+
+    def fetcher():
+        calls["n"] += 1
+        return {"BABA": 1577552, "PDD": 1737806}
+
+    r1 = c.get_or_fetch("edgar_ticker_map", fetcher)
+    r2 = c.get_or_fetch("edgar_ticker_map", fetcher)
+    assert calls["n"] == 1  # 第二次命中缓存，不再调 fetcher
+    assert r1 == {"BABA": 1577552, "PDD": 1737806}
+    assert r2 == r1
+    assert (tmp_path / "cache" / "edgar_ticker_map.json").exists()
+
+
+def test_dict_ttl_expiry(tmp_path):
+    c = Cache(tmp_path / "cache", ttl_days=7)
+    c.put("k", {"a": 1})
+    old = time.time() - 10 * 86400
+    os.utime(c._json_path("k"), (old, old))
+    assert c.get("k") is None
+    assert c.exists("k")  # 文件仍在，仅视为不新鲜
+
+
+def test_empty_dict_not_cached(tmp_path):
+    c = Cache(tmp_path / "cache", ttl_days=None)
+    c.get_or_fetch("k", lambda: {})
+    assert not c.exists("k")
+
+
+def test_dataframe_and_dict_coexist(tmp_path):
+    c = Cache(tmp_path / "cache", ttl_days=None)
+    c.put("dfk", pd.DataFrame({"x": [1]}))
+    c.put("dictk", {"a": 1})
+    assert isinstance(c.get("dfk"), pd.DataFrame)
+    assert c.get("dictk") == {"a": 1}

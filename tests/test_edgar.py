@@ -111,3 +111,39 @@ def test_ticker_map_failure_returns_empty(monkeypatch):
     monkeypatch.setattr(edgar, "_get_json", lambda url: None)
     assert edgar._ticker_cik_map() == {}
     assert edgar.resolve_cik("JD") is None
+
+
+def test_full_chain_with_real_cache(monkeypatch, tmp_path):
+    """回归：真实 Cache 下 dict 走 JSON 缓存路径。
+
+    修复前：缓存 miss 时 get_or_fetch 对 dict 调 df.empty 抛 AttributeError，
+    被 resolve_cik 吞掉 -> CIK 永远解析失败 -> 美股净利全部 missing。
+    """
+    from chp500.data.cache import Cache
+
+    monkeypatch.setattr(edgar, "_CACHE", Cache(tmp_path / "cache", ttl_days=None))
+    calls = {"n": 0}
+
+    def fake_get_json(url):
+        calls["n"] += 1
+        if "company_tickers" in url:
+            return {"0": {"cik_str": 1577552, "ticker": "BABA"}}
+        if url.endswith("/us-gaap/NetIncomeLoss.json"):
+            return _concept(_entries("CNY", [
+                ("2024-01-01", "2024-12-31", 100.0e8),
+                ("2025-01-01", "2025-12-31", 120.0e8),
+            ]))
+        return None
+
+    monkeypatch.setattr(edgar, "_get_json", fake_get_json)
+
+    assert edgar.resolve_cik("BABA") == 1577552
+    res = edgar.fetch_us_net_income("BABA")
+    assert res is not None
+    assert res["ttm"] == 120.0e8
+
+    # 再走一遍：ticker map 与 concept 均命中 JSON 缓存，不再打网络
+    n_before = calls["n"]
+    res2 = edgar.fetch_us_net_income("BABA")
+    assert res2 == res
+    assert calls["n"] == n_before

@@ -113,15 +113,15 @@ def load_summary(universe: str) -> dict:
         for _, r in c.sort_values("weight", ascending=False).iterrows()
     ]
 
-    # 数据源覆盖（东财/EDGAR 真实数据 vs 静态/合成兜底）
+    # 数据源覆盖（腾讯行情/EDGAR 真实数据 vs 缺失）
     src = {"shares": {}, "profit": {}}
     if "shares_source" in c.columns:
         src["shares"] = {str(k): int(v) for k, v in c["shares_source"].value_counts().items()}
     if "profit_source" in c.columns:
         src["profit"] = {str(k): int(v) for k, v in c["profit_source"].value_counts().items()}
     n_all = max(len(c), 1)
-    real_shares = src["shares"].get("em", 0) / n_all
-    real_profit = (src["profit"].get("em", 0) + src["profit"].get("edgar", 0)) / n_all
+    real_shares = src["shares"].get("tencent", 0) / n_all
+    real_profit = (src["profit"].get("tencent", 0) + src["profit"].get("edgar", 0)) / n_all
 
     return {
         "universe": universe,

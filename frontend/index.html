@@ -4,21 +4,25 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CHP 500 指数 · Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%233b82f6'/%3E%3Cstop offset='1' stop-color='%238b5cf6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3Ctext x='16' y='21' font-family='Arial' font-size='13' font-weight='700' fill='white' text-anchor='middle'%3ECH%3C/text%3E%3C/svg%3E" />
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header>
-    <h1>CHP 500 指数 <span class="badge">CHP 500</span></h1>
+    <div class="brand">
+      <div class="logo">CH</div>
+      <h1>CHP 500 指数 <span class="badge">China 500</span></h1>
+    </div>
     <div class="controls">
-      <label>宇宙
+      <label class="ctl">宇宙
         <select id="universe">
           <option value="expanded">expanded（~500）</option>
           <option value="curated">curated（精选）</option>
         </select>
       </label>
-      <button id="reload">刷新数据</button>
-      <button id="build">重新构建</button>
+      <button id="reload" class="btn">刷新数据</button>
+      <button id="build" class="btn primary">重新构建</button>
       <span id="status" class="status"></span>
     </div>
   </header>
@@ -36,13 +40,13 @@
     <section class="card">
       <h3>成分明细 <span id="tbl-count" class="muted"></span></h3>
       <div class="table-wrap"><table id="tbl"><thead>
-        <tr><th>#</th><th>代码</th><th>名称</th><th>市场</th><th>行业</th><th>权重</th></tr>
+        <tr><th>#</th><th>代码</th><th>名称</th><th>市场</th><th>行业</th><th class="num">权重</th></tr>
       </thead><tbody></tbody></table></div>
     </section>
   </main>
 
   <footer>
-    <p class="muted">指数编制方法论研究与教学用途，不构成投资建议。后端 REST API：<code>/api/summary</code>、<code>/api/build</code>。</p>
+    <p class="muted">指数编制方法论研究与教学用途，不构成投资建议。REST API：<code>/api/summary</code>、<code>/api/build</code>、<code>/api/build/status</code></p>
   </footer>
 
   <script src="/app.js"></script>

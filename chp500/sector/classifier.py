@@ -38,6 +38,20 @@ def map_to_sector(industry: str) -> str:
     return "其他"
 
 
+def classify_hk_us_sector(name: str, industry: str | None = None) -> str:
+    """港美行业兜底归类。
+
+    优先用人工核定的 industry 列；缺失时退化为对公司名称做关键词映射
+    （港美免费行情接口无干净 GICS 字段，见 README 已知限制）。A 股行业由雪球实时提供，
+    不走此路径。
+    """
+    if isinstance(industry, str) and industry.strip():
+        return map_to_sector(industry)
+    if isinstance(name, str) and name.strip():
+        return map_to_sector(name)
+    return "其他"
+
+
 def add_sector(df: pd.DataFrame, industry_col: str = "industry") -> pd.DataFrame:
     out = df.copy()
     out["sector"] = out[industry_col].map(map_to_sector)

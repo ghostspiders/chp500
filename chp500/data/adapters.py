@@ -42,10 +42,35 @@ CACHE = Cache()
 # ---------------------------------------------------------------------------
 # 基础行情 / 行情
 # ---------------------------------------------------------------------------
+_A_UNIVERSE_CACHE = DATA_DIR / "a_universe.csv"
+
+
 def fetch_a_universe() -> pd.DataFrame:
-    """A 股全量代码/名称。"""
-    df = ak.stock_info_a_code_name()
-    df = df.rename(columns={"code": "code", "name": "name"})
+    """A 股全量代码/名称。
+
+    优先走 akshare（SSE+SZSE 实时）。深交所(szse.cn)在本环境偶发不可达，
+    此时回退到本地缓存 data/a_universe.csv（实时获取成功后落盘，或已由历史构建产物播种）；
+    若连缓存都没有，最后退而求其次只取 SSE 主板，保证构建不完全中断。
+    """
+    try:
+        df = ak.stock_info_a_code_name()
+        df = df[["code", "name"]]
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df.to_csv(_A_UNIVERSE_CACHE, index=False, encoding="utf-8-sig")
+    except Exception as e:  # noqa: BLE001
+        if _A_UNIVERSE_CACHE.exists():
+            print(f"[warn] akshare 获取 A 股宇宙失败，回退本地缓存 data/a_universe.csv：{e}")
+            df = pd.read_csv(_A_UNIVERSE_CACHE, dtype={"code": str})
+        else:
+            try:
+                sse = ak.stock_info_sh_name_code(symbol="主板A股")[["code", "name"]]
+                sse["code"] = sse["code"].astype(str).str.zfill(6)
+                print(f"[warn] 深交所行情源不可达，A 股宇宙回退为 SSE 主板（{len(sse)} 只）：{e}")
+                sse["market"] = "A"
+                sse["entity_id"] = "A." + sse["code"]
+                return sse[["entity_id", "code", "name", "market"]]
+            except Exception:
+                raise RuntimeError(f"A 股宇宙获取失败且无本地缓存：{e}")
     df["market"] = "A"
     df["entity_id"] = "A." + df["code"].astype(str)
     return df[["entity_id", "code", "name", "market"]]
@@ -411,6 +436,22 @@ def apply_real_earnings(out: pd.DataFrame, market: str, usd_cny: float) -> pd.Da
     return out
 
 
+def build_hk_us_candidates(market: str) -> pd.DataFrame:
+    """港股/美股候选池读取（可插拔）。
+
+    默认读取人工核定的参考表（demo_hk.csv / demo_us.csv）。若同目录下
+    `generated/{hk,us}_candidates.csv` 存在，则合并并按 code 去重（人工表优先），
+    便于后续用可达数据源（如 akshare）离线生成更全的候选池，而无需改动此处。
+    """
+    fname = "demo_hk.csv" if market == "HK" else "demo_us.csv"
+    ref = pd.read_csv(DATA_DIR / fname, dtype={"code": str})
+    gen = DATA_DIR / "generated" / f"{(market or '').lower()}_candidates.csv"
+    if gen.exists():
+        extra = pd.read_csv(gen, dtype={"code": str})
+        ref = pd.concat([ref, extra], ignore_index=True).drop_duplicates(subset=["code"], keep="first")
+    return ref
+
+
 def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: pd.DataFrame) -> pd.DataFrame:
     """港股/美股 listing 级快照（严格真实模式）。
 
@@ -422,12 +463,12 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     - 现价/成交量：Sina daily（价格与腾讯快照价一致）。
     不再有任何近似回落（reference/synthetic/static）。
     """
-    from ..sector.classifier import map_to_sector
+    from ..sector.classifier import map_to_sector, classify_hk_us_sector
 
     as_of = pd.Timestamp(as_of or datetime.now())
     fname = "demo_hk.csv" if market == "HK" else "demo_us.csv"
     curr = "HKD" if market == "HK" else "USD"
-    ref = pd.read_csv(DATA_DIR / fname, dtype={"code": str})
+    ref = build_hk_us_candidates(market)
 
     codes = ref["code"].astype(str).tolist()
     prices = fetch_hk_us_price(codes, market, as_of)
@@ -459,9 +500,9 @@ def build_hk_us_listing_snapshot(as_of: datetime | None, market: str, fx_table: 
     # 真实财务覆盖：US=SEC EDGAR（HK 已由腾讯 PE 推导）；缺失标记 missing，不回落静态
     out = apply_real_earnings(out, market, usd_cny=fx.fx_rate_on(fx_table, as_of, "USD"))
 
-    # 行业：参考表人工核定 + GICS 映射（展示字段）
+    # 行业：参考表人工核定（最高优先级）+ GICS 映射；缺失时退化为对名称做关键词归类
     out["industry"] = out["code"].map(ref.set_index("code")["industry"])
-    out["sector"] = out["industry"].map(map_to_sector)
+    out["sector"] = out.apply(lambda r: classify_hk_us_sector(r.get("name"), r.get("industry")), axis=1)
     # 真实上市日（Sina 全量日线首日推导）
     out["listing_date"] = out["code"].map(lambda c: _first_listed_date(c, market))
 

@@ -25,12 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chp500.config import CONFIG, BASE_DIR  # noqa: E402
 from chp500.data import adapters  # noqa: E402
-from chp500.data import fx as fxmod  # noqa: E402
 from chp500.filter import screens  # noqa: E402
 from chp500.sector import classifier  # noqa: E402
 from chp500.weight import calculator  # noqa: E402
 from chp500.committee import review  # noqa: E402
-from chp500.index import series as idx  # noqa: E402
+from chp500.index import persistent as pidx  # noqa: E402
+from chp500.data import benchmark as benchmod  # noqa: E402
 
 
 def build_snapshot(as_of, mode, markets, universe="curated"):
@@ -59,7 +59,7 @@ def _clean_price(ser: pd.Series) -> pd.Series:
     return ser.ffill().bfill()
 
 
-def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
+def run(as_of, mode, out_dir: Path, markets=None, universe="curated", kind="rebalance"):
     out_dir.mkdir(parents=True, exist_ok=True)
     if as_of is None:
         as_of = datetime.now().strftime("%Y-%m-%d")
@@ -95,57 +95,29 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     constituents.to_csv(out_dir / "constituents.csv", index=False, encoding="utf-8-sig")
     print(f"[out] 成分已写入 {out_dir / 'constituents.csv'}（{len(constituents)} 只）")
 
-    # 6) 指数序列（基于成分各自主上市地历史行情 + 主上市地自由流通股，跨市场按汇率折算 CNY）
-    start = (as_of - pd.Timedelta(days=365)).strftime("%Y%m%d")
-    end = as_of.strftime("%Y%m%d")
-    fx_period = fxmod.fetch_fx_history(["USD", "HKD"], start, end)
-
-    cny_prices = {}  # entity_id -> 每日 CNY 每股价格序列
-
-    # 按市场批量并发抓取历史行情（已按 code 全量缓存，重跑命中缓存）
-    a_codes = constituents.loc[constituents["market"] == "A", "code"].tolist()
-    hk_codes = constituents.loc[constituents["market"] == "HK", "code"].tolist()
-    us_codes = constituents.loc[constituents["market"] == "US", "code"].tolist()
-    a_prices, _ = adapters.fetch_hist(a_codes, start, end) if a_codes else (pd.DataFrame(), pd.DataFrame())
-    hk_prices, _ = adapters.fetch_hk_us_hist(hk_codes, "HK", start, end) if hk_codes else (pd.DataFrame(), pd.DataFrame())
-    us_prices, _ = adapters.fetch_hk_us_hist(us_codes, "US", start, end) if us_codes else (pd.DataFrame(), pd.DataFrame())
-
-    for _, row in constituents.iterrows():
-        eid, mkt, code, curr = row["entity_id"], row["market"], row["code"], row["curr"]
-        try:
-            if mkt == "A":
-                if code not in a_prices.columns:
-                    continue
-                ser = a_prices[code].copy()
-            else:
-                src = hk_prices if mkt == "HK" else us_prices
-                if code not in src.columns:
-                    continue
-                ser = src[code].copy()
-                fxser = fx_period.get(curr, pd.Series(1.0, index=ser.index))
-                fxser = fxser.reindex(ser.index).ffill().bfill().fillna(1.0)
-                ser = ser * fxser  # 折算 CNY
-        except Exception:  # noqa: BLE001
-            continue
-        ser = _clean_price(ser)
-        if ser is None or ser.empty or ser.notna().sum() < 2:
-            continue
-        cny_prices[eid] = ser
-
-    cny_prices = pd.DataFrame(cny_prices)
-    cny_prices = cny_prices.dropna(how="all").sort_index()
-    # 跨市场行情源（Sina A/HK/US）偶有缺失交易日，按"个股最新已知价向前填充"对齐，
-    # 避免成分在某日缺数被剔出导致指数无谓跳变（指数编制标准做法）。
-    cny_prices = cny_prices.ffill()
-    fs = constituents.set_index("entity_id")["float_shares"]
-    common = [e for e in cny_prices.columns if e in fs.index]
-    cny_prices = cny_prices[common]
-    fs = fs[common]
-    if cny_prices.shape[0] > 1 and not fs.empty:
-        index_df = idx.build_series(cny_prices, fs, base_point=1000.0)
-        index_df.to_csv(out_dir / "index.csv", encoding="utf-8-sig")
-        print(f"[out] 指数序列已写入 {out_dir / 'index.csv'}（{len(index_df)} 个交易日，"
-              f"{len(common)} 只成分有行情）")
+    # 6) 指数序列（连续累积，落 SQLite；固定基期、篮子变动调除数保持连续）
+    #    取代原先「每次重算近一年、基准重置」的覆盖式 index.csv。
+    db_path = out_dir / "chp500.db"
+    con = pidx.open_db(db_path)
+    basket_cols = ["entity_id", "code", "name", "market", "curr", "sector", "industry",
+                   "price", "total_shares", "float_shares", "float_mcap", "iwf",
+                   "ttm_net_profit", "liquidity_ratio", "weight",
+                   "shares_source", "profit_source"]
+    basket = final[basket_cols].copy()
+    index_cfg = CONFIG.get("index") or {}
+    inc = index_cfg.get("inception_date") if isinstance(index_cfg, dict) else None
+    base_point = float((index_cfg.get("base_point", 1000.0))
+                       if isinstance(index_cfg, dict) else 1000.0)
+    summary_idx = pidx.update_index(
+        con, basket, str(as_of.date()), kind=kind,
+        inception_date=inc, base_point=base_point)
+    print(f"[out] 指数已更新（{summary_idx['message']}）；库：{db_path}")
+    levels = pd.read_sql_query(
+        "SELECT date, price_index, total_return FROM index_levels ORDER BY date", con)
+    if not levels.empty:
+        levels.to_csv(out_dir / "index.csv", index=False, encoding="utf-8-sig")
+        index_df = levels
+        print(f"[out] 指数序列已写入 {out_dir / 'index.csv'}（{len(levels)} 个交易日）")
     else:
         print("[warn] 历史行情不足，跳过指数序列")
         index_df = None
@@ -181,18 +153,73 @@ def run(as_of, mode, out_dir: Path, markets=None, universe="curated"):
     return constituents, index_df
 
 
+def run_daily(as_of, out_dir: Path, universe: str = "curated"):
+    """仅按当前篮子补点净值（轻量，无需重算快照；要求已至少有一次再平衡）。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if as_of is None:
+        as_of = datetime.now().strftime("%Y-%m-%d")
+    as_of = pd.Timestamp(as_of)
+    con = pidx.open_db(out_dir / "chp500.db")
+    basket = pidx.current_basket(con)
+    if basket is None:
+        raise RuntimeError("尚无再平衡历史，请先跑一次完整构建（--rebalance）。")
+    added = pidx.append_daily(con, basket, str(as_of.date()))
+    levels = pd.read_sql_query(
+        "SELECT date, price_index, total_return FROM index_levels ORDER BY date", con)
+    if not levels.empty:
+        levels.to_csv(out_dir / "index.csv", index=False, encoding="utf-8-sig")
+    n = 0 if added is None else len(added)
+    print(f"[daily] 补点完成：新增 {n} 个交易日；库：{out_dir / 'chp500.db'}")
+
+
+def run_benchmarks(as_of, out_dir: Path, universe: str = "curated"):
+    """刷新对比基准序列（v1 仅入库；归一化对比延后）。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    con = pidx.open_db(out_dir / "chp500.db")
+    bench_ids = CONFIG.get("benchmarks") or ["csi300"]
+    end = as_of or datetime.now().strftime("%Y-%m-%d")
+    end = pd.Timestamp(end)
+    start = (end - pd.Timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    for b in bench_ids:
+        try:
+            n = benchmod.refresh_benchmark(con, b, start, end.strftime("%Y-%m-%d"))
+            print(f"[bench] {b}: 入库 {n} 条（{start} ~ {end.date()}）")
+        except Exception as e:  # noqa: BLE001
+            print(f"[bench] {b} 抓取失败：{type(e).__name__}: {e}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="CHP 500 指数编制")
+    ap = argparse.ArgumentParser(description="CHP 500 指数编制（常年运行：再平衡 + 每日补点 + 基准）")
     ap.add_argument("--as-of", default=datetime.now().strftime("%Y-%m-%d"), help="再平衡/评估日")
     ap.add_argument("--mode", choices=["demo", "live"], default="demo")
     ap.add_argument("--markets", default=",".join(CONFIG.get("markets", ["A", "HK", "US"])),
                     help="参与市场，逗号分隔，如 A,HK,US")
-    ap.add_argument("--out-dir", default=str(BASE_DIR / "outputs"))
+    ap.add_argument("--out-dir", default=None,
+                    help="输出目录（默认 outputs/<universe>，与 API 一致）")
     ap.add_argument("--universe", choices=["curated", "expanded"], default="curated",
                     help="curated=精选参考集(~50)；expanded=全量 A 股(真实名/价/利+近似股本)推向~500")
+    # 运行模式
+    ap.add_argument("--rebalance", action="store_true",
+                    help="完整再平衡（默认；建库或篮子变动均走此路径）")
+    ap.add_argument("--daily", action="store_true",
+                    help="仅按当前篮子补点净值（轻量，不重算快照）")
+    ap.add_argument("--iwf-refresh", action="store_true",
+                    help="周度 IWF/股本刷新（重算快照，调除数保持连续）")
+    ap.add_argument("--backfill", action="store_true",
+                    help="从 config.index.inception_date 起一次性建库/补历史")
+    ap.add_argument("--benchmarks", action="store_true",
+                    help="仅刷新对比基准序列（沪深300 等）")
     args = ap.parse_args()
     markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
-    run(args.as_of, args.mode, Path(args.out_dir), markets, args.universe)
+    out_dir = Path(args.out_dir) if args.out_dir else (BASE_DIR / "outputs" / args.universe)
+
+    if args.benchmarks:
+        run_benchmarks(args.as_of, out_dir, args.universe)
+    elif args.daily:
+        run_daily(args.as_of, out_dir, args.universe)
+    else:
+        kind = "iwf_refresh" if args.iwf_refresh else ("backfill" if args.backfill else "rebalance")
+        run(args.as_of, args.mode, out_dir, markets, args.universe, kind=kind)
 
 
 if __name__ == "__main__":

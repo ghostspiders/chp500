@@ -50,6 +50,13 @@ markets:                     # 覆盖市场
   - HK
   - US
 
+# ---- 指数连续序列（常年运行）----
+index:
+  inception_date: null        # 基期日期（YYYY-MM-DD）；留空=首次构建取 as_of-365，随后累积
+  base_point: 1000.0          # 基期点位
+benchmarks:                  # 对比基准（v1 仅入库，归一化对比延后）
+  - csi300
+
 # ---- 数据源（单一事实来源：每个源一个条目，罗列接口/调用 API 与策略） ----
 # transport: http=requests 直连（base_url 可改址覆盖）；akshare=经 akshare 调用（接口明细仅供排查）；
 #            local=本地文件

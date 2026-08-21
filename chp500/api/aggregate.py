@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from ..config import BASE_DIR
+from ..index import persistent as pidx
+from ..data import benchmark as benchmod
 
 # 宇宙名会拼进文件系统路径，必须限定为安全的短标识符
 UNIVERSE_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
@@ -161,3 +164,78 @@ def list_universes() -> list[str]:
     if (base / "constituents.csv").exists() and "curated" not in names:
         names.append("curated")
     return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# 常年运行：连续指数 / 再平衡历史 / 运行日志 / 基准（读取自 SQLite）
+# ---------------------------------------------------------------------------
+
+def _db_path(universe: str) -> Path:
+    if not is_valid_universe_name(universe):
+        raise FileNotFoundError(f"非法宇宙名：{universe!r}")
+    p = BASE_DIR / "outputs" / universe / "chp500.db"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"未找到宇宙 '{universe}' 的数据库：{p}（请先运行构建以建库）")
+    return p
+
+
+def load_index_history(universe: str, from_date: str | None = None,
+                       to_date: str | None = None) -> pd.DataFrame:
+    """连续指数净值序列（可限区间）。"""
+    con = sqlite3.connect(str(_db_path(universe)))
+    sql = ("SELECT date, price_index, total_return, divisor, rebalance_as_of "
+           "FROM index_levels")
+    where, params = [], []
+    if from_date:
+        where.append("date >= ?"); params.append(from_date)
+    if to_date:
+        where.append("date <= ?"); params.append(to_date)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY date"
+    df = pd.read_sql_query(sql, con, params=params)
+    con.close()
+    return df
+
+
+def list_rebalances(universe: str) -> list[dict]:
+    con = pidx.open_db(_db_path(universe))
+    return pidx.list_rebalances(con)
+
+
+def load_rebalance(universe: str, as_of: str) -> list[dict]:
+    con = pidx.open_db(_db_path(universe))
+    cols = [r[1] for r in con.execute("PRAGMA table_info(rebalances)").fetchall()]
+    rows = con.execute("SELECT * FROM rebalances WHERE as_of = ? ORDER BY weight DESC",
+                       (as_of,)).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def load_runs(universe: str) -> list[dict]:
+    con = pidx.open_db(_db_path(universe))
+    cols = ["id", "as_of", "kind", "started_at", "finished_at",
+            "status", "n_constituents", "message"]
+    rows = con.execute(
+        "SELECT id, as_of, kind, started_at, finished_at, status, "
+        "n_constituents, message FROM runs ORDER BY id DESC LIMIT 200").fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def list_benchmarks(universe: str) -> list[dict]:
+    con = pidx.open_db(_db_path(universe))
+    out = []
+    for b in benchmod.list_benchmarks(con):
+        s = benchmod.benchmark_series(con, b)
+        out.append({
+            "bench_id": b,
+            "n": int(len(s)),
+            "start": s["date"].min() if not s.empty else None,
+            "end": s["date"].max() if not s.empty else None,
+        })
+    return out
+
+
+def load_benchmark_series(universe: str, bench_id: str) -> pd.DataFrame:
+    con = pidx.open_db(_db_path(universe))
+    return benchmod.benchmark_series(con, bench_id)

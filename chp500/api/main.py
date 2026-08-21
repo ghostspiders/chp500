@@ -16,7 +16,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -157,6 +157,85 @@ def build_status(
     with _BUILDING_LOCK:
         status = _BUILDING.get(universe, "idle")
     return {"universe": universe, "status": status}
+
+
+# ---- 常年运行：连续指数 / 再平衡历史 / 运行日志 / 基准 ----
+
+@app.get("/api/universe/{universe}/history")
+def universe_history(
+    universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN),
+    from_date: str | None = Query(default=None, description="YYYY-MM-DD 下限"),
+    to_date: str | None = Query(default=None, description="YYYY-MM-DD 上限"),
+):
+    try:
+        df = aggregate.load_index_history(universe, from_date, to_date)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "universe": universe,
+        "dates": df["date"].tolist(),
+        "price_index": [float(x) for x in df["price_index"].tolist()],
+        "total_return": [float(x) for x in df["total_return"].tolist()],
+        "divisor": [float(x) for x in df["divisor"].tolist()],
+        "rebalance_as_of": df["rebalance_as_of"].fillna("").tolist(),
+    }
+
+
+@app.get("/api/universe/{universe}/rebalances")
+def universe_rebalances(universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN)):
+    try:
+        return {"universe": universe, "rebalances": aggregate.list_rebalances(universe)}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/universe/{universe}/rebalance/{as_of}")
+def universe_rebalance_detail(
+    universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN),
+    as_of: str = Path(),
+):
+    try:
+        rows = aggregate.load_rebalance(universe, as_of)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"未找到再平衡 {as_of}")
+    return {"universe": universe, "as_of": as_of, "constituents": rows}
+
+
+@app.get("/api/universe/{universe}/runs")
+def universe_runs(universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN)):
+    try:
+        return {"universe": universe, "runs": aggregate.load_runs(universe)}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/universe/{universe}/benchmarks")
+def universe_benchmarks(universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN)):
+    try:
+        return {"universe": universe, "benchmarks": aggregate.list_benchmarks(universe)}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/universe/{universe}/benchmark/{bench_id}")
+def universe_benchmark_series(
+    universe: str = Path(pattern=aggregate.UNIVERSE_NAME_PATTERN),
+    bench_id: str = Path(),
+):
+    try:
+        df = aggregate.load_benchmark_series(universe, bench_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"未找到基准 {bench_id}")
+    return {
+        "universe": universe,
+        "bench_id": bench_id,
+        "dates": df["date"].tolist(),
+        "close": [float(x) for x in df["close"].tolist()],
+    }
 
 
 # ---- 静态前端（置于 API 路由之后，避免覆盖 /api） ----

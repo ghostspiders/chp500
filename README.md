@@ -111,6 +111,28 @@ pytest
 
 ---
 
+## 常年运行与存储（连续指数）
+
+指数从「覆盖式快照」升级为**连续累积的时间序列**，支撑常年跟踪与历史回看：
+
+- **存储**：每个宇宙一个 SQLite 库 `outputs/<universe>/chp500.db`，含四张表：
+  `index_levels`（连续净值，固定基期、篮子变动调除数保持严格连续）、
+  `rebalances`（历次再平衡成分权重快照）、`benchmarks`（对比基准原始收盘价，先沪深300）、
+  `runs`（持久化运行日志，替代进程内 `_BUILDING`）。
+- **运行模式**（`scripts/build_index.py`）：
+  - `--rebalance` 完整再平衡（默认；首次运行即建库）
+  - `--daily` 仅按当前篮子补点净值（轻量，不重算快照）
+  - `--iwf-refresh` 周度 IWF/股本刷新（重算快照并调除数保持连续）
+  - `--backfill` 从 `config.index.inception_date` 起一次性补历史
+  - `--benchmarks` 刷新对比基准序列（沪深300 等）
+- **调度**：`./scripts/scheduler.sh install` 写入系统 cron（日补点 / 周 IWF / 季再平衡 / 日基准）。
+- **读取接口（API）**：`/api/universe/{u}/history`、`/rebalances`、`/rebalance/{as_of}`、
+  `/runs`、`/benchmarks`、`/benchmark/{id}`。
+
+> 对比基准的归一化叠加展示（与其他指数对比）为后续工作；v1 仅完成基准数据入库。
+
+---
+
 ## 数据流
 
 ```
